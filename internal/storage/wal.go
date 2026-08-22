@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bufio"
-	"encoding/binary"
 	"io"
 	"os"
 )
@@ -11,14 +10,13 @@ import (
 // written here (and fsync'd) BEFORE it is applied to the memtable. On restart
 // we replay the WAL to rebuild the memtable exactly as it was.
 //
-// On-disk record format (integers are big-endian):
+// On-disk record format (integers are big-endian) — identical to the SSTable
+// DATA entry, so both go through encodeRecord/decodeRecord in codec.go:
 //
 //	+--------+---------+---------+-----------+-----------+
 //	| kind   | keyLen  | key     | valueLen  | value     |
 //	| 1 byte | 4 bytes | keyLen  | 4 bytes   | valueLen  |
 //	+--------+---------+---------+-----------+-----------+
-//
-// For a delete (tombstone), kind = opDelete and valueLen = 0.
 type WAL struct {
 	f *os.File
 	w *bufio.Writer
@@ -35,22 +33,8 @@ func OpenWAL(path string) (*WAL, error) {
 
 // Append writes one record into the buffer. It is NOT durable until Sync.
 func (l *WAL) Append(r record) error {
-	if err := l.w.WriteByte(byte(r.kind)); err != nil {
-		return err
-	}
-	if err := binary.Write(l.w, binary.BigEndian, uint32(len(r.key))); err != nil {
-		return err
-	}
-	if _, err := l.w.Write(r.key); err != nil {
-		return err
-	}
-	if err := binary.Write(l.w, binary.BigEndian, uint32(len(r.value))); err != nil {
-		return err
-	}
-	if _, err := l.w.Write(r.value); err != nil {
-		return err
-	}
-	return nil
+	_, err := encodeRecord(l.w, r)
+	return err
 }
 
 // Sync flushes the buffer and fsyncs the file, forcing the OS to persist the
@@ -73,35 +57,14 @@ func Replay(path string, fn func(record) error) error {
 
 	r := bufio.NewReader(f)
 	for {
-		// Read the 1-byte kind. A clean EOF here means we've read every
-		// complete record — that's the normal way this loop ends.
-		kind, err := r.ReadByte()
+		rec, err := decodeRecord(r)
 		if err == io.EOF {
-			return nil
+			return nil // clean end: we read every complete record
 		}
 		if err != nil {
 			return err
 		}
-
-		var keyLen uint32
-		if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
-			return err
-		}
-		key := make([]byte, keyLen)
-		if _, err := io.ReadFull(r, key); err != nil {
-			return err
-		}
-
-		var valueLen uint32
-		if err := binary.Read(r, binary.BigEndian, &valueLen); err != nil {
-			return err
-		}
-		value := make([]byte, valueLen)
-		if _, err := io.ReadFull(r, value); err != nil {
-			return err
-		}
-
-		if err := fn(record{kind: op(kind), key: key, value: value}); err != nil {
+		if err := fn(rec); err != nil {
 			return err
 		}
 	}

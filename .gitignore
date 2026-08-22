@@ -1,0 +1,6 @@
+# runtime data
+/data/
+
+# built binaries
+/kestrel
+/kestrel.exe

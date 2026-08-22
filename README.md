@@ -1,56 +1,51 @@
 # Kestrel
 
 A distributed, replicated, crash-safe key-value database, built from scratch.
-See `DESIGN.md` for the full plan. This repo is at **Phase 1** (Layer 1: the
-write-ahead log + memtable).
+See `DESIGN.md` for the full plan.
+
+**Current state: Phase 2** (Layer 1 — storage engine: WAL + skiplist memtable +
+SSTables). Phase 1 (WAL + memtable) is complete; Phase 2 adds flushing to
+on-disk SSTables and a multi-level read path.
 
 ## Prerequisites
 
-Install Go 1.22+ from https://go.dev/dl/ and confirm:
+Install Go 1.22+ from https://go.dev/dl/ and confirm: `go version`
 
-```bash
-go version
-```
-
-## Run the tests (your Phase 1 to-do list)
-
-The tests in `internal/storage/db_test.go` are the spec. They fail right now
-because three functions are stubbed with `panic("TODO...")`. Implement them and
-the tests go green:
+## Run the tests
 
 ```bash
 go test ./...
 ```
 
-## Try it by hand
+The Phase 1 tests pass already. The Phase 2 tests fail until you implement the
+four stubs in `internal/storage/sstable.go` — see `PHASE2.md`.
 
-Once the tests pass, run the REPL:
+## Try it by hand
 
 ```bash
 go run ./cmd/kestrel
-# > put name kestrel
-# > get name
-# kestrel
+# > put a 1
+# > flush          # writes ./data/000000.sst
+# > get a
+# 1
 # > exit
-# ...run it again and `get name` still works — that's the WAL doing its job.
 ```
 
 ## Layout
 
 ```
 kestrel/
-├── go.mod                       module definition
-├── cmd/
-│   └── kestrel/
-│       └── main.go              a tiny REPL to poke the store by hand
-└── internal/
-    └── storage/                 Layer 1 — the storage engine
-        ├── storage.go           Engine interface + shared types  (done)
-        ├── memtable.go          in-memory layer                  (TODO: you)
-        ├── wal.go               write-ahead log                  (TODO: you)
-        ├── db.go                wires WAL + memtable together     (done)
-        └── db_test.go           the Phase 1 spec / tests         (done)
+├── go.mod
+├── DESIGN.md                    full project design doc
+├── PHASE2.md                    current phase build guide
+├── cmd/kestrel/main.go          REPL (put/get/del/flush/exit)
+└── internal/storage/            Layer 1 — the storage engine
+    ├── storage.go               Engine interface + types      (done)
+    ├── codec.go                 shared record encode/decode   (done)
+    ├── memtable.go              skiplist memtable             (done)
+    ├── wal.go                   write-ahead log               (done)
+    ├── db.go                    flush + multi-level reads     (done)
+    ├── sstable.go               SSTable read/write        (TODO: you)
+    ├── sstable_test.go          isolated SSTable spec         (done)
+    └── db_test.go               Phase 1 + Phase 2 tests       (done)
 ```
-
-`internal/` is a Go convention: packages under it can only be imported by code
-in this module, which keeps the public surface clean.
