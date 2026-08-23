@@ -15,6 +15,7 @@ import (
 //	get <key>
 //	del <key>
 //	flush            force the memtable out to a new .sst file
+//	compact          merge all .sst files into one, dropping dead data
 //	exit
 //
 // Data is written to ./data so you can quit, restart, and confirm it persisted.
@@ -25,7 +26,7 @@ func main() {
 	}
 	defer db.Close()
 
-	fmt.Println("kestrel storage REPL — commands: put / get / del / flush / exit")
+	fmt.Println("kestrel storage REPL — commands: put / get / del / flush / compact / exit")
 	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
@@ -71,6 +72,12 @@ func main() {
 				fmt.Println("error:", err)
 			} else {
 				fmt.Println("flushed memtable to an sstable (see ./data/*.sst)")
+			}
+		case "compact":
+			if err := db.Compact(); err != nil {
+				fmt.Println("error:", err)
+			} else {
+				fmt.Println("compacted all sstables into one (dead data reclaimed)")
 			}
 		case "exit", "quit":
 			return
