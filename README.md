@@ -3,9 +3,9 @@
 A distributed, replicated, crash-safe key-value database, built from scratch.
 See `DESIGN.md` for the full plan.
 
-**Current state: Phase 3a** (Layer 1 — storage engine). Done: WAL + skiplist
-memtable (Phase 1), SSTables + flushing + multi-level reads (Phase 2).
-In progress: compaction (Phase 3a). Next: Bloom filters (3b), manifest (3c).
+**Current state: Phase 4** (Layer 2 — Raft). Layer 1 storage engine done
+(P1 WAL+memtable, P2 SSTables, P3a compaction, P3b Bloom filters; P3c manifest
+deferred). In progress: Raft leader election (P4). See PROGRESS.md.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ go test ./...
 ```
 
 The Phase 1/2 tests pass already. The Phase 3a tests fail until you implement
-`mergeSSTables` in `internal/storage/merge.go` — see `PHASE3.md`.
+the Bloom filter methods in `internal/storage/bloom.go` — see `PHASE3B.md`.
 
 ## Try it by hand
 
@@ -40,7 +40,7 @@ go run ./cmd/kestrel
 kestrel/
 ├── go.mod
 ├── DESIGN.md                    full project design doc
-├── PHASE3.md                    current phase build guide
+├── PHASE3.md                    current phase build guide (see also PHASE3.md, PROGRESS.md)
 ├── cmd/kestrel/main.go          REPL (put/get/del/flush/compact/exit)
 └── internal/storage/            Layer 1 — the storage engine
     ├── storage.go               Engine interface + types      (done)
@@ -50,7 +50,8 @@ kestrel/
     ├── sstable.go               SSTable read/write            (done, Phase 2)
     ├── db.go                    flush + multi-level reads     (done)
     ├── compaction.go            SSTable iterator + Compact()  (done)
-    ├── merge.go                 k-way merge            (TODO: you, Phase 3a)
+    ├── merge.go                 k-way merge                   (done, P3a)
+    ├── bloom.go                 Bloom filter           (TODO: you, P3b)
     ├── sstable_test.go          isolated SSTable spec         (done)
     ├── db_test.go               Phase 1 + Phase 2 tests       (done)
     └── compaction_test.go       Phase 3a tests                (done)

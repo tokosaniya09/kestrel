@@ -1,0 +1,114 @@
+package raft
+
+// This is your Phase 4 implementation file. Four methods, all running under the
+// lock (their callers acquire r.mu for you), so you write pure state-machine
+// logic — no goroutines, no locking. See PHASE4.md for the full walkthrough.
+
+// startElection runs when the election timeout fires. It turns this node into a
+// candidate for a new term and tries to win a majority of votes.
+//
+// Steps:
+//  1. Under the lock: currentTerm++, role = Candidate, votedFor = own id,
+//     resetElectionTimer(), and snapshot the new term + build a RequestVoteArgs.
+//  2. Release the lock, then gather votes:
+//        granted := 1 + r.requestVotesFromPeers(args)   // 1 = your own vote
+//  3. Re-acquire the lock. Only become leader if you're STILL a candidate in the
+//     SAME term you started (requestVotesFromPeers may have stepped you down on a
+//     higher term, or a heartbeat may have arrived) AND granted isMajority.
+//
+func (r *Raft) startElection() {
+	r.mu.Lock()
+	r.currentTerm++
+	r.role = Candidate
+	r.votedFor = r.id
+	r.resetElectionTimer()
+	term := r.currentTerm
+	args := RequestVoteArgs{Term: term, CandidateID: r.id}
+	r.mu.Unlock()
+
+	granted := 1 + r.requestVotesFromPeers(args)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.role == Candidate && r.currentTerm == term && r.isMajority(granted) {
+		r.becomeLeader()
+	}
+}
+
+// becomeLeader promotes this node to leader. Assumes mu held. (Phase 5 will also
+// initialize per-peer log bookkeeping here.)
+func (r *Raft) becomeLeader() {
+	r.role = Leader
+	r.leaderID = r.id
+}
+
+// handleRequestVote decides whether to grant a vote. Runs under the lock.
+//
+// Rules:
+//   - If args.Term > currentTerm: becomeFollower(args.Term) first (a higher term
+//     always wins).
+//   - Reply carries currentTerm.
+//   - If args.Term < currentTerm: deny (stale candidate).
+//   - Otherwise grant iff you haven't voted this term, or already voted for THIS
+//     candidate (votedFor == -1 || votedFor == args.CandidateID). On granting,
+//     record votedFor and resetElectionTimer() (you've "heard from" the cluster).
+//
+// (The log-freshness check is a Phase 5 addition.) See PHASE4.md "Step 2".
+func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
+	if args.Term > r.currentTerm {
+		r.becomeFollower(args.Term)
+	}
+
+	reply := RequestVoteReply{
+		Term:        r.currentTerm,
+		VoteGranted: false,
+	}
+
+	if args.Term < r.currentTerm {
+		return reply
+	}
+
+	if r.votedFor == -1 || r.votedFor == args.CandidateID {
+		r.votedFor = args.CandidateID
+		r.role = Follower
+		r.resetElectionTimer()
+		reply.VoteGranted = true
+	}
+
+	return reply
+}
+
+
+// handleAppendEntries handles a heartbeat from a leader. Runs under the lock.
+//
+// Rules:
+//   - If args.Term > currentTerm: becomeFollower(args.Term).
+//   - Reply carries currentTerm.
+//   - If args.Term < currentTerm: reply Success=false (reject a stale leader).
+//   - Otherwise this is the legitimate leader for the term: set role = Follower,
+//     record leaderID, resetElectionTimer(), reply Success=true. (Accepting a
+//     current-term heartbeat is how a losing candidate reverts to follower.)
+//
+// See PHASE4.md "Step 3".
+func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
+	if args.Term > r.currentTerm {
+		r.becomeFollower(args.Term)
+	}
+
+	reply := AppendEntriesReply{
+		Term:    r.currentTerm,
+		Success: false,
+	}
+
+	if args.Term < r.currentTerm {
+		return reply
+	}
+
+	r.role = Follower
+	r.leaderID = args.LeaderID
+	r.resetElectionTimer()
+	reply.Success = true
+
+	return reply
+}

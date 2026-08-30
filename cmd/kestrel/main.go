@@ -31,6 +31,9 @@ func main() {
 	for {
 		fmt.Print("> ")
 		if !sc.Scan() {
+			if err := sc.Err(); err != nil {
+				fmt.Println("error reading input:", err)
+			}
 			return
 		}
 		parts := strings.Fields(sc.Text())
