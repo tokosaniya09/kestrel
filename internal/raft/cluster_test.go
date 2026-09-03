@@ -79,9 +79,11 @@ func (t *inmemTransport) SendAppendEntries(to int, a AppendEntriesArgs) (AppendE
 }
 
 type cluster struct {
-	net   *network
-	rafts map[int]*Raft
-	n     int
+	net        *network
+	rafts      map[int]*Raft
+	persisters map[int]Persister // Phase 6: kept alive across restart() calls
+	peers      []int
+	n          int
 
 	appliedMu sync.Mutex
 	applied   map[int][]ApplyMsg // per-node, in the order each node applied them
@@ -93,9 +95,18 @@ func makeCluster(n int) *cluster {
 	for i := range peers {
 		peers[i] = i
 	}
-	c := &cluster{net: net, rafts: map[int]*Raft{}, n: n, applied: map[int][]ApplyMsg{}}
+	c := &cluster{
+		net:        net,
+		rafts:      map[int]*Raft{},
+		persisters: map[int]Persister{},
+		peers:      peers,
+		n:          n,
+		applied:    map[int][]ApplyMsg{},
+	}
 	for i := 0; i < n; i++ {
-		r := NewRaft(i, peers, &inmemTransport{net: net, from: i})
+		mp := NewMemoryPersister()
+		c.persisters[i] = mp
+		r := NewRaft(i, peers, &inmemTransport{net: net, from: i}, mp)
 		net.add(i, r)
 		c.rafts[i] = r
 	}
@@ -122,6 +133,22 @@ func (c *cluster) reconnect(id int)  { c.net.setDown(id, false) }
 func (c *cluster) crash(id int) {
 	c.net.setDown(id, true)
 	c.rafts[id].Stop()
+}
+
+// restart simulates the node at id crashing and coming back: the OLD Raft
+// instance is stopped, and a BRAND NEW one is built from scratch — reusing the
+// SAME persister, so it recovers exactly the currentTerm/votedFor/log that were
+// durably saved, and nothing else (role, commitIndex, etc. start fresh, as they
+// should). It's re-registered in the network under the same id so RPCs route to
+// the new instance transparently, and gets its own fresh drainApplied goroutine
+// since it has a brand new ApplyCh.
+func (c *cluster) restart(id int) {
+	c.rafts[id].Stop()
+	newRaft := NewRaft(id, c.peers, &inmemTransport{net: c.net, from: id}, c.persisters[id])
+	c.net.add(id, newRaft) // overwrite: RPCs to this id now reach the new instance
+	c.rafts[id] = newRaft
+	newRaft.Start()
+	go c.drainApplied(id, newRaft)
 }
 
 func (c *cluster) stopAll() {

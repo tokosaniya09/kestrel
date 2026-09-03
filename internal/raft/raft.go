@@ -63,6 +63,8 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
+	persister Persister // Phase 6: durably saves currentTerm/votedFor/log
+
 	lastHeard       time.Time
 	electionTimeout time.Duration
 
@@ -70,8 +72,13 @@ type Raft struct {
 	stopOnce sync.Once
 }
 
-// NewRaft creates a node. peers must list every id in the cluster, including id.
-func NewRaft(id int, peers []int, transport Transport) *Raft {
+// NewRaft creates a node. peers must list every id in the cluster, including
+// id. persister recovers currentTerm/votedFor/log if this node has run before
+// (a restart after a real or simulated crash); role, leaderID, commitIndex, and
+// lastApplied are volatile and always start fresh, per the Raft paper's split
+// between persistent and volatile state (Figure 2) — a restarted node always
+// comes back as a plain follower, never resumes being leader.
+func NewRaft(id int, peers []int, transport Transport, persister Persister) *Raft {
 	r := &Raft{
 		id:          id,
 		peers:       peers,
@@ -84,7 +91,20 @@ func NewRaft(id int, peers []int, transport Transport) *Raft {
 		commitIndex: 0,
 		lastApplied: 0,
 		applyCh:     make(chan ApplyMsg, 256),
+		persister:   persister,
 		stopCh:      make(chan struct{}),
+	}
+	if data, err := persister.Load(); err == nil && len(data) > 0 {
+		if term, votedFor, log, derr := decodeState(data); derr == nil {
+			r.currentTerm = term
+			r.votedFor = votedFor
+			r.log = log
+		}
+		// A decode error on existing data means corrupted persisted state — a
+		// real system should fail loudly rather than silently start fresh
+		// (silently discarding it could enable exactly the double-vote /
+		// lost-log-entry bugs persistence exists to prevent). Treating it as
+		// "fresh" here is a known simplification — a good stretch goal.
 	}
 	r.resetElectionTimer()
 	return r
@@ -128,6 +148,8 @@ func (r *Raft) Propose(command interface{}) (index int, term int, isLeader bool)
 		return -1, r.currentTerm, false
 	}
 	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: command})
+	r.persist() // the log just grew — must survive a crash before we tell the
+	// caller it was accepted
 	index = r.lastLogIndex()
 	r.matchIndex[r.id] = index // the leader always "has" what it just appended
 	return index, r.currentTerm, true
@@ -212,6 +234,7 @@ func (r *Raft) becomeFollower(term int) {
 	r.currentTerm = term
 	r.role = Follower
 	r.votedFor = -1
+	r.persist() // currentTerm and votedFor just changed — must survive a crash
 	r.resetElectionTimer()
 }
 

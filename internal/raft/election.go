@@ -22,6 +22,9 @@ func (r *Raft) startElection() {
 	r.currentTerm++
 	r.role = Candidate
 	r.votedFor = r.id
+	r.persist() // Phase 6: durably record the new term/vote BEFORE anyone hears
+	// about it — if we crash right after unlocking but before any reply comes
+	// back, a restart must still remember we already voted for ourselves here.
 	r.resetElectionTimer()
 	term := r.currentTerm
 	args := RequestVoteArgs{
@@ -29,7 +32,7 @@ func (r *Raft) startElection() {
 		CandidateID:  r.id,
 		LastLogIndex: r.lastLogIndex(),
 		LastLogTerm:  r.lastLogTerm(),
-	}	
+	}
 	r.mu.Unlock() // <-- release BEFORE sending RPCs
 
 	granted := 1 + r.requestVotesFromPeers(args) // 1 = our own vote
@@ -64,11 +67,14 @@ func (r *Raft) becomeLeader() {
 //     always wins).
 //   - Reply carries currentTerm.
 //   - If args.Term < currentTerm: deny (stale candidate).
+//   - The candidate's log must be at least as up to date as ours (Phase 5):
+//     a higher LastLogTerm wins outright; on a tie, a longer/equal log wins.
+//     This is what stops a node whose log fell behind from ever becoming leader.
 //   - Otherwise grant iff you haven't voted this term, or already voted for THIS
 //     candidate (votedFor == -1 || votedFor == args.CandidateID). On granting,
 //     record votedFor and resetElectionTimer() (you've "heard from" the cluster).
 //
-// (The log-freshness check is a Phase 5 addition.) See PHASE4.md "Step 2".
+// See PHASE4.md "Step 2", PHASE5.md "Step 4c".
 func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)
@@ -83,6 +89,8 @@ func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	if (r.votedFor == -1 || r.votedFor == args.CandidateID) && upToDate {
 		r.votedFor = args.CandidateID
+		r.persist() // Phase 6: must survive a crash — otherwise a restart could
+		// grant a second, conflicting vote in a term we already voted in
 		r.role = Follower
 		r.resetElectionTimer()
 		reply.VoteGranted = true
@@ -90,16 +98,22 @@ func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	return reply
 }
 
-// handleAppendEntries handles a heartbeat from a leader. Runs under the lock.
+// handleAppendEntries handles a heartbeat/replication call from a leader. Runs
+// under the lock.
 //
 // Rules:
 //   - If args.Term > currentTerm: becomeFollower(args.Term).
 //   - Reply carries currentTerm.
 //   - If args.Term < currentTerm: reply Success=false (reject a stale leader).
 //   - Otherwise this is the legitimate leader for the term: set role = Follower,
-//     record leaderID, resetElectionTimer(), reply Success=true. (Accepting a
-//     current-term heartbeat is how a losing candidate reverts to follower.)
-//
+//     record leaderID, resetElectionTimer().
+//   - Consistency check: our log must contain PrevLogIndex with PrevLogTerm, or
+//     we refuse (Success stays false) and the leader backs up nextIndex and
+//     retries.
+//   - Append new entries, truncating at the first conflict (same index,
+//     different term) and leaving already-matching entries alone.
+//   - Advance our own commitIndex from LeaderCommit, capped at what we actually
+//     have.
 func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)
@@ -135,6 +149,11 @@ func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 			break
 		}
 	}
+	r.persist() // Phase 6: the log may have changed — must survive a crash
+	// before we ack. (Unconditional here for simplicity — even a pure
+	// heartbeat with no actual change re-persists the whole log. That's
+	// correct but wasteful; only persisting when the log truly changed is a
+	// good stretch goal once this is working.)
 
 	if args.LeaderCommit > r.commitIndex {
 		newCommit := args.LeaderCommit
