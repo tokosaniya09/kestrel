@@ -205,3 +205,16 @@ func (c *cluster) appliedCount(id int) int {
 	defer c.appliedMu.Unlock()
 	return len(c.applied[id])
 }
+
+// dump logs every node's term/role/log length/commit/leader-belief, for
+// diagnosing exactly what a cluster is doing when a test misbehaves. Go's
+// testing framework always prints t.Log output for a FAILING test, so this
+// shows up automatically on failure without needing -v.
+func (c *cluster) dump(t *testing.T, label string) {
+	t.Helper()
+	for id := 0; id < c.n; id++ {
+		term, role, logLen, commit, leaderID := c.rafts[id].DebugState()
+		t.Logf("[%s] node %d: term=%d role=%s logLen=%d commitIndex=%d leaderID=%d down=%v",
+			label, id, term, role, logLen, commit, leaderID, c.net.isDown(id))
+	}
+}

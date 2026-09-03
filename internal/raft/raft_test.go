@@ -2,7 +2,6 @@ package raft
 
 import (
 	"testing"
-	"time"
 )
 
 // A fresh 3-node cluster must elect exactly one leader.

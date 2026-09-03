@@ -108,6 +108,15 @@ func (r *Raft) GetState() (term int, isLeader bool) {
 // A later phase feeds these into the KV store's state machine.
 func (r *Raft) ApplyCh() <-chan ApplyMsg { return r.applyCh }
 
+// DebugState returns a snapshot of this node's role, term, log length, commit
+// index, and believed leader. Diagnostic only — not used by the protocol
+// itself, just by tests trying to see what's actually going on.
+func (r *Raft) DebugState() (term int, role Role, logLen int, commitIndex int, leaderID int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.currentTerm, r.role, len(r.log), r.commitIndex, r.leaderID
+}
+
 // Propose appends command to the leader's own log for replication. Returns the
 // index the command occupies, the current term, and whether this node is
 // actually the leader (if false, the command was NOT accepted — the caller must

@@ -77,7 +77,11 @@ func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if args.Term < r.currentTerm {
 		return reply // stale candidate
 	}
-	if r.votedFor == -1 || r.votedFor == args.CandidateID {
+
+	upToDate := args.LastLogTerm > r.lastLogTerm() ||
+		(args.LastLogTerm == r.lastLogTerm() && args.LastLogIndex >= r.lastLogIndex())
+
+	if (r.votedFor == -1 || r.votedFor == args.CandidateID) && upToDate {
 		r.votedFor = args.CandidateID
 		r.role = Follower
 		r.resetElectionTimer()

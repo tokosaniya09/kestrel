@@ -79,6 +79,7 @@ func TestFollowerCatchesUpAfterPartition(t *testing.T) {
 	defer c.stopAll()
 
 	leader := c.checkOneLeader(t)
+	c.dump(t, "initial leader elected")
 	var laggard int
 	for id := range c.rafts {
 		if id != leader {
@@ -95,15 +96,32 @@ func TestFollowerCatchesUpAfterPartition(t *testing.T) {
 	}
 	// Leader + the one remaining follower are still a majority of 3.
 	if !c.waitApplied(3, 3*time.Second) {
+		c.dump(t, "waitApplied timed out")
 		t.Fatal("commands should commit via leader + the one remaining follower")
 	}
+	c.dump(t, "before reconnect")
 
 	c.reconnect(laggard)
 
-	deadline := time.Now().Add(3 * time.Second)
+	// NOTE: while isolated, the laggard's own election timeout may have fired
+	// one or more times. Each attempt bumps its currentTerm even though the
+	// vote never reaches anyone (it's cut off) — so its term can end up higher
+	// than the rest of the cluster's, invisibly. The moment it reconnects, that
+	// inflated term becomes live: the next exchange with it can force the
+	// CURRENT, perfectly healthy leader to step down (per "a higher term always
+	// wins"), even though nothing was wrong. This is a known, real Raft
+	// phenomenon — a rejoining partitioned node disrupting a healthy cluster —
+	// which production Raft addresses with a "PreVote" phase (a candidate checks
+	// it could plausibly win BEFORE bumping its term). We haven't built that
+	// (a good stretch goal), so we just give the cluster room to re-settle.
+	c.checkOneLeader(t)
+	c.dump(t, "after post-reconnect re-election settled")
+
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && c.appliedCount(laggard) < 3 {
 		time.Sleep(50 * time.Millisecond)
 	}
+	c.dump(t, "final state")
 	if got := c.appliedCount(laggard); got < 3 {
 		t.Fatalf("node %d never caught up after reconnecting: applied %d/3", laggard, got)
 	}
