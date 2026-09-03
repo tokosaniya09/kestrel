@@ -3,9 +3,9 @@
 A distributed, replicated, crash-safe key-value database, built from scratch.
 See `DESIGN.md` for the full plan.
 
-**Current state: Phase 4** (Layer 2 — Raft). Layer 1 storage engine done
-(P1 WAL+memtable, P2 SSTables, P3a compaction, P3b Bloom filters; P3c manifest
-deferred). In progress: Raft leader election (P4). See PROGRESS.md.
+**Current state: Phase 5** (Layer 2 — Raft). Layer 1 storage engine done.
+Raft leader election (P4) done. In progress: Raft log replication (P5).
+See PROGRESS.md for full status.
 
 ## Prerequisites
 

@@ -27,9 +27,6 @@ func (r Role) String() string {
 	return "?"
 }
 
-// Timing. Election timeouts are randomized in [min,max] so nodes don't all become
-// candidates at once. Heartbeats must be frequent enough that a follower hears
-// from the leader well within its election timeout.
 const (
 	electionTimeoutMin = 150 * time.Millisecond
 	electionTimeoutMax = 300 * time.Millisecond
@@ -39,25 +36,35 @@ const (
 
 // Raft is one node. All mutable state is guarded by mu.
 //
-// The golden locking rule: NEVER send an RPC (call anything on r.transport) while
-// holding mu. Snapshot what you need under the lock, unlock, then send. The RPC
-// *handlers* (handleRequestVote / handleAppendEntries) run under the lock and
-// must never send RPCs themselves. This is what keeps the cluster deadlock-free.
+// The golden locking rule: NEVER send an RPC while holding mu. Snapshot what you
+// need under the lock, unlock, then send. RPC *handlers* and the leader-side
+// decision functions you write in replication.go run under the lock and must
+// never send RPCs themselves.
 type Raft struct {
 	mu        sync.Mutex
 	id        int
-	peers     []int // all node ids, including this one
+	peers     []int
 	transport Transport
 
-	// Core Raft state (persisted for real in Phase 6).
+	// Election state (Phase 4).
 	currentTerm int
-	votedFor    int // candidate id voted for in currentTerm, or -1
+	votedFor    int
 	role        Role
-	leaderID    int // best guess at the current leader, or -1
+	leaderID    int
 
-	// Election timing.
-	lastHeard       time.Time     // last time we heard from a leader or granted a vote
-	electionTimeout time.Duration // current randomized timeout
+	// Replicated log (Phase 5). 1-indexed; log[0] is a Term-0 sentinel.
+	log         []LogEntry
+	commitIndex int // highest index known committed
+	lastApplied int // highest index handed to the state machine so far
+
+	// Leader-only bookkeeping (Phase 5), (re)initialized in becomeLeader.
+	nextIndex  map[int]int // next log index to send each peer
+	matchIndex map[int]int // highest index known replicated on each peer (+ self)
+
+	applyCh chan ApplyMsg
+
+	lastHeard       time.Time
+	electionTimeout time.Duration
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -73,15 +80,22 @@ func NewRaft(id int, peers []int, transport Transport) *Raft {
 		votedFor:    -1,
 		role:        Follower,
 		leaderID:    -1,
+		log:         []LogEntry{{Term: 0}}, // sentinel at index 0
+		commitIndex: 0,
+		lastApplied: 0,
+		applyCh:     make(chan ApplyMsg, 256),
 		stopCh:      make(chan struct{}),
 	}
 	r.resetElectionTimer()
 	return r
 }
 
-// Start launches the node's background loop. Stop halts it (safe to call twice).
-func (r *Raft) Start() { go r.run() }
-func (r *Raft) Stop()  { r.stopOnce.Do(func() { close(r.stopCh) }) }
+// Start launches the node's background loops. Stop halts them (safe to call twice).
+func (r *Raft) Start() {
+	go r.run()
+	go r.applyLoop()
+}
+func (r *Raft) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
 // GetState reports the current term and whether this node believes it is leader.
 func (r *Raft) GetState() (term int, isLeader bool) {
@@ -90,8 +104,27 @@ func (r *Raft) GetState() (term int, isLeader bool) {
 	return r.currentTerm, r.role == Leader
 }
 
-// run is the heartbeat/election ticker. As leader it broadcasts heartbeats; as
-// follower/candidate it starts an election once its timeout elapses.
+// ApplyCh is where committed entries arrive, in increasing CommandIndex order.
+// A later phase feeds these into the KV store's state machine.
+func (r *Raft) ApplyCh() <-chan ApplyMsg { return r.applyCh }
+
+// Propose appends command to the leader's own log for replication. Returns the
+// index the command occupies, the current term, and whether this node is
+// actually the leader (if false, the command was NOT accepted — the caller must
+// find the real leader, which a later phase automates).
+func (r *Raft) Propose(command interface{}) (index int, term int, isLeader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.role != Leader {
+		return -1, r.currentTerm, false
+	}
+	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: command})
+	index = r.lastLogIndex()
+	r.matchIndex[r.id] = index // the leader always "has" what it just appended
+	return index, r.currentTerm, true
+}
+
+// run is the heartbeat/election ticker.
 func (r *Raft) run() {
 	for {
 		select {
@@ -107,7 +140,7 @@ func (r *Raft) run() {
 		r.mu.Unlock()
 
 		if role == Leader {
-			r.broadcastHeartbeats()
+			r.broadcastAppendEntries()
 			time.Sleep(heartbeatInterval)
 		} else {
 			if elapsed >= timeout {
@@ -118,8 +151,39 @@ func (r *Raft) run() {
 	}
 }
 
-// --- RPC entry points: the transport calls these on the receiving node. Each
-// locks and delegates to a handler you implement in election.go. ---
+// applyLoop hands newly committed entries to applyCh in order. It never sends
+// while holding mu: it snapshots what's newly committed, unlocks, then sends.
+func (r *Raft) applyLoop() {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
+
+		r.mu.Lock()
+		var toApply []ApplyMsg
+		for r.lastApplied < r.commitIndex {
+			r.lastApplied++
+			toApply = append(toApply, ApplyMsg{
+				CommandIndex: r.lastApplied,
+				Command:      r.log[r.lastApplied].Command,
+			})
+		}
+		r.mu.Unlock()
+
+		for _, m := range toApply {
+			select {
+			case r.applyCh <- m:
+			case <-r.stopCh:
+				return
+			}
+		}
+		time.Sleep(tickInterval)
+	}
+}
+
+// --- RPC entry points ---
 
 func (r *Raft) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	r.mu.Lock()
@@ -133,10 +197,8 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	return r.handleAppendEntries(args)
 }
 
-// --- Provided helpers you'll call from election.go ---
+// --- Provided helpers ---
 
-// becomeFollower steps down to follower at the given term, clearing the vote.
-// Call this whenever you observe a term higher than your own. Assumes mu held.
 func (r *Raft) becomeFollower(term int) {
 	r.currentTerm = term
 	r.role = Follower
@@ -144,8 +206,6 @@ func (r *Raft) becomeFollower(term int) {
 	r.resetElectionTimer()
 }
 
-// resetElectionTimer marks "just heard from the cluster" and rolls a fresh
-// randomized timeout. Assumes mu held.
 func (r *Raft) resetElectionTimer() {
 	r.lastHeard = time.Now()
 	r.electionTimeout = randomElectionTimeout()
@@ -166,16 +226,13 @@ func (r *Raft) otherPeers() []int {
 	return out
 }
 
-// isMajority reports whether votes is a strict majority of the cluster. Assumes
-// mu held (reads len(r.peers), which never changes in this phase).
 func (r *Raft) isMajority(votes int) bool {
 	return votes*2 > len(r.peers)
 }
 
 // requestVotesFromPeers sends RequestVote to every peer concurrently and returns
-// how many GRANTED (not counting this node's own vote). If any reply carries a
-// higher term, it steps this node down to follower. Provided so you don't have to
-// write the goroutine fan-out.
+// how many GRANTED (not counting this node's own vote). Steps down on any
+// higher-term reply.
 func (r *Raft) requestVotesFromPeers(args RequestVoteArgs) int {
 	var (
 		mu      sync.Mutex
@@ -208,27 +265,41 @@ func (r *Raft) requestVotesFromPeers(args RequestVoteArgs) int {
 	return granted
 }
 
-// broadcastHeartbeats sends an empty AppendEntries to every peer. If a reply has a
-// higher term, this leader steps down. Provided.
-func (r *Raft) broadcastHeartbeats() {
+// broadcastAppendEntries sends AppendEntries to every peer, built per-peer via
+// your buildAppendEntriesArgs (replication.go). Handles the network fan-out and
+// higher-term step-down; hands a normal-term reply to your
+// handleAppendEntriesReply for the actual replication/commit decisions.
+func (r *Raft) broadcastAppendEntries() {
 	r.mu.Lock()
 	if r.role != Leader {
 		r.mu.Unlock()
 		return
 	}
-	args := AppendEntriesArgs{Term: r.currentTerm, LeaderID: r.id}
+	peers := r.otherPeers()
 	r.mu.Unlock()
 
-	for _, peer := range r.otherPeers() {
+	for _, peer := range peers {
 		go func(peer int) {
+			r.mu.Lock()
+			if r.role != Leader {
+				r.mu.Unlock()
+				return
+			}
+			args := r.buildAppendEntriesArgs(peer) // YOU implement (replication.go)
+			r.mu.Unlock()
+
 			reply, ok := r.transport.SendAppendEntries(peer, args)
 			if !ok {
 				return
 			}
+
 			r.mu.Lock()
 			if reply.Term > r.currentTerm {
 				r.becomeFollower(reply.Term)
+				r.mu.Unlock()
+				return
 			}
+			r.handleAppendEntriesReply(peer, args, reply) // YOU implement
 			r.mu.Unlock()
 		}(peer)
 	}

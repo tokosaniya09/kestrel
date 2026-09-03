@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// An in-memory cluster + network for tests. A node marked "down" can neither send
-// nor receive RPCs — that models a crash or a partition.
+// An in-memory cluster + network for tests. A node marked "down" can neither
+// send nor receive RPCs (in either direction) — that models a crash or a
+// partition that fully isolates it.
 
 type network struct {
 	mu    sync.Mutex
@@ -81,6 +82,9 @@ type cluster struct {
 	net   *network
 	rafts map[int]*Raft
 	n     int
+
+	appliedMu sync.Mutex
+	applied   map[int][]ApplyMsg // per-node, in the order each node applied them
 }
 
 func makeCluster(n int) *cluster {
@@ -89,19 +93,31 @@ func makeCluster(n int) *cluster {
 	for i := range peers {
 		peers[i] = i
 	}
-	rafts := map[int]*Raft{}
+	c := &cluster{net: net, rafts: map[int]*Raft{}, n: n, applied: map[int][]ApplyMsg{}}
 	for i := 0; i < n; i++ {
 		r := NewRaft(i, peers, &inmemTransport{net: net, from: i})
 		net.add(i, r)
-		rafts[i] = r
+		c.rafts[i] = r
 	}
-	for _, r := range rafts {
+	for id, r := range c.rafts {
 		r.Start()
+		go c.drainApplied(id, r)
 	}
-	return &cluster{net: net, rafts: rafts, n: n}
+	return c
+}
+
+// drainApplied copies every committed entry a node produces into c.applied, so
+// tests can inspect what each node has actually applied, in order.
+func (c *cluster) drainApplied(id int, r *Raft) {
+	for m := range r.ApplyCh() {
+		c.appliedMu.Lock()
+		c.applied[id] = append(c.applied[id], m)
+		c.appliedMu.Unlock()
+	}
 }
 
 func (c *cluster) disconnect(id int) { c.net.setDown(id, true) }
+func (c *cluster) reconnect(id int)  { c.net.setDown(id, false) }
 
 func (c *cluster) crash(id int) {
 	c.net.setDown(id, true)
@@ -160,4 +176,32 @@ func (c *cluster) checkNoLeader(t *testing.T) {
 			t.Fatalf("node %d is leader but no majority is reachable", id)
 		}
 	}
+}
+
+// waitApplied polls until a majority of nodes have applied at least minCount
+// entries, or the timeout elapses.
+func (c *cluster) waitApplied(minCount int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ready := 0
+		for id := range c.rafts {
+			c.appliedMu.Lock()
+			n := len(c.applied[id])
+			c.appliedMu.Unlock()
+			if n >= minCount {
+				ready++
+			}
+		}
+		if ready*2 > c.n {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+func (c *cluster) appliedCount(id int) int {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	return len(c.applied[id])
 }

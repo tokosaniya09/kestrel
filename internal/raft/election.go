@@ -24,7 +24,12 @@ func (r *Raft) startElection() {
 	r.votedFor = r.id
 	r.resetElectionTimer()
 	term := r.currentTerm
-	args := RequestVoteArgs{Term: term, CandidateID: r.id}
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateID:  r.id,
+		LastLogIndex: r.lastLogIndex(),
+		LastLogTerm:  r.lastLogTerm(),
+	}	
 	r.mu.Unlock() // <-- release BEFORE sending RPCs
 
 	granted := 1 + r.requestVotesFromPeers(args) // 1 = our own vote
@@ -43,7 +48,13 @@ func (r *Raft) startElection() {
 func (r *Raft) becomeLeader() {
 	r.role = Leader
 	r.leaderID = r.id
-	// (Phase 5 initializes per-peer log indices here.)
+	r.nextIndex = map[int]int{}
+	r.matchIndex = map[int]int{}
+	for _, p := range r.peers {
+		r.nextIndex[p] = r.lastLogIndex() + 1
+		r.matchIndex[p] = 0
+	}
+	r.matchIndex[r.id] = r.lastLogIndex()
 }
 
 // handleRequestVote decides whether to grant a vote. Runs under the lock.
@@ -85,19 +96,50 @@ func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 //     record leaderID, resetElectionTimer(), reply Success=true. (Accepting a
 //     current-term heartbeat is how a losing candidate reverts to follower.)
 //
-// See PHASE4.md "Step 3".
 func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)
 	}
 	reply := AppendEntriesReply{Term: r.currentTerm, Success: false}
 	if args.Term < r.currentTerm {
-		return reply // stale leader — reject
+		return reply // stale leader
 	}
-	// Legitimate leader for this term.
+
 	r.role = Follower
 	r.leaderID = args.LeaderID
 	r.resetElectionTimer()
+
+	// Consistency check: our log must contain PrevLogIndex with PrevLogTerm.
+	if args.PrevLogIndex > r.lastLogIndex() || r.termAt(args.PrevLogIndex) != args.PrevLogTerm {
+		return reply // Success stays false; leader will back up nextIndex and retry
+	}
+
+	// Append new entries, truncating at the first conflict (same index, different
+	// term) and leaving already-matching entries alone.
+	insertAt := args.PrevLogIndex + 1
+	for i, e := range args.Entries {
+		idx := insertAt + i
+		if idx <= r.lastLogIndex() {
+			if r.log[idx].Term != e.Term {
+				r.log = r.log[:idx] // discard the conflicting entry and everything after
+				r.log = append(r.log, args.Entries[i:]...)
+				break
+			}
+			// same term at this index already — already have it, keep scanning
+		} else {
+			r.log = append(r.log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	if args.LeaderCommit > r.commitIndex {
+		newCommit := args.LeaderCommit
+		if last := r.lastLogIndex(); newCommit > last {
+			newCommit = last // never commit past what we actually have
+		}
+		r.commitIndex = newCommit
+	}
+
 	reply.Success = true
 	return reply
 }
