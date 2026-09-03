@@ -2,6 +2,7 @@ package raft
 
 import (
 	"testing"
+	"time"
 )
 
 // A fresh 3-node cluster must elect exactly one leader.
@@ -32,16 +33,34 @@ func TestReElectionAfterLeaderFails(t *testing.T) {
 	}
 }
 
-// With only a minority reachable, no leader can be elected.
+// With only a minority reachable, no leader can be elected — and if a leader
+// already existed, it becomes unable to commit anything (though, without a
+// CheckQuorum extension, it won't necessarily know it's lost quorum).
 func TestNoLeaderWithoutMajority(t *testing.T) {
 	c := makeCluster(3)
 	defer c.stopAll()
 
-	c.checkOneLeader(t)
+	leader := c.checkOneLeader(t)
 
-	// Take down two of three: no node can reach a majority.
-	c.disconnect(0)
-	c.disconnect(1)
+	// Disconnect the LEADER itself plus one follower, so the single node left
+	// standing is guaranteed to be a plain follower that never won an election.
+	// (Hardcoding two fixed ids here would be wrong: election timeouts are
+	// randomized, so the winner varies run to run. If the winner happened to be
+	// the one node left connected, it would correctly still report itself as
+	// leader — Raft leaders don't auto-detect lost quorum — and this test would
+	// wrongly fail on a correct implementation.)
+	c.disconnect(leader)
+	remaining := 1
+	for id := range c.rafts {
+		if id == leader {
+			continue
+		}
+		if remaining == 0 {
+			break
+		}
+		c.disconnect(id)
+		remaining--
+	}
 
 	c.checkNoLeader(t)
 }
