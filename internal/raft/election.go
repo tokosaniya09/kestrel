@@ -16,6 +16,7 @@ package raft
 //     SAME term you started (requestVotesFromPeers may have stepped you down on a
 //     higher term, or a heartbeat may have arrived) AND granted isMajority.
 //
+// See PHASE4.md "Step 1 — startElection".
 func (r *Raft) startElection() {
 	r.mu.Lock()
 	r.currentTerm++
@@ -24,13 +25,14 @@ func (r *Raft) startElection() {
 	r.resetElectionTimer()
 	term := r.currentTerm
 	args := RequestVoteArgs{Term: term, CandidateID: r.id}
-	r.mu.Unlock()
+	r.mu.Unlock() // <-- release BEFORE sending RPCs
 
-	granted := 1 + r.requestVotesFromPeers(args)
+	granted := 1 + r.requestVotesFromPeers(args) // 1 = our own vote
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
+	// Only take power if we're still the candidate we were when we started:
+	// a higher-term reply or an incoming heartbeat may have changed things.
 	if r.role == Candidate && r.currentTerm == term && r.isMajority(granted) {
 		r.becomeLeader()
 	}
@@ -41,6 +43,7 @@ func (r *Raft) startElection() {
 func (r *Raft) becomeLeader() {
 	r.role = Leader
 	r.leaderID = r.id
+	// (Phase 5 initializes per-peer log indices here.)
 }
 
 // handleRequestVote decides whether to grant a vote. Runs under the lock.
@@ -59,26 +62,18 @@ func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)
 	}
-
-	reply := RequestVoteReply{
-		Term:        r.currentTerm,
-		VoteGranted: false,
-	}
-
+	reply := RequestVoteReply{Term: r.currentTerm, VoteGranted: false}
 	if args.Term < r.currentTerm {
-		return reply
+		return reply // stale candidate
 	}
-
 	if r.votedFor == -1 || r.votedFor == args.CandidateID {
 		r.votedFor = args.CandidateID
 		r.role = Follower
 		r.resetElectionTimer()
 		reply.VoteGranted = true
 	}
-
 	return reply
 }
-
 
 // handleAppendEntries handles a heartbeat from a leader. Runs under the lock.
 //
@@ -95,20 +90,14 @@ func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)
 	}
-
-	reply := AppendEntriesReply{
-		Term:    r.currentTerm,
-		Success: false,
-	}
-
+	reply := AppendEntriesReply{Term: r.currentTerm, Success: false}
 	if args.Term < r.currentTerm {
-		return reply
+		return reply // stale leader — reject
 	}
-
+	// Legitimate leader for this term.
 	r.role = Follower
 	r.leaderID = args.LeaderID
 	r.resetElectionTimer()
 	reply.Success = true
-
 	return reply
 }
