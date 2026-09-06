@@ -85,7 +85,23 @@ func TestFollowerReceivesSnapshotAfterFallingBehind(t *testing.T) {
 	}
 
 	c.reconnect(laggard)
-	c.checkOneLeader(t) // let any transient churn settle (same caution as Phase 5)
+
+	// Reconnecting an isolated node can trigger the same disruptive-rejoin
+	// phenomenon found in Phase 5 (its election timer kept firing while cut
+	// off, inflating its term) — which can force a NEW election, possibly
+	// landing leadership on a DIFFERENT node than the one that just called
+	// Snapshot(). Each node's snapshot state is independent, so if leadership
+	// actually moved, the new leader has its own full, uncompacted log and
+	// wouldn't otherwise know to send an InstallSnapshot at all — it would
+	// just replicate the backlog via ordinary AppendEntries instead, which is
+	// correct behavior but not what THIS test needs to exercise. Re-snapshot
+	// on whichever node ends up leading (a no-op if it's still the same one)
+	// so the test deterministically hits InstallSnapshot regardless of
+	// incidental churn.
+	newLeader := c.checkOneLeader(t)
+	if err := c.rafts[newLeader].Snapshot(commitIdx, []byte("state-through-e")); err != nil {
+		t.Fatalf("Snapshot failed on %d: %v", newLeader, err)
+	}
 
 	// The laggard's local "state machine" must actually receive the snapshot
 	// via ApplyCh — checked through the cluster's recorded copy, since
@@ -105,9 +121,11 @@ func TestFollowerReceivesSnapshotAfterFallingBehind(t *testing.T) {
 		t.Fatalf("laggard's snapshotIndex = %d, want %d", laggardSnapIndex, commitIdx)
 	}
 
-	// Normal replication must continue working afterward.
-	if _, _, isLeader := c.rafts[leader].Propose("f"); !isLeader {
-		t.Fatalf("expected %d to still be leader", leader)
+	// Normal replication must continue working afterward. Use newLeader, not
+	// the original leader variable — if churn happened, the original leader
+	// may no longer BE the leader.
+	if _, _, isLeader := c.rafts[newLeader].Propose("f"); !isLeader {
+		t.Fatalf("expected %d to still be leader", newLeader)
 	}
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
