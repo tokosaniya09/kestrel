@@ -157,6 +157,15 @@ func (r *Raft) GetState() (term int, isLeader bool) {
 	return r.currentTerm, r.role == Leader
 }
 
+// Leader returns this node's best current guess at the cluster's leader, or -1
+// if it doesn't know (e.g. an election is in progress). Phase 8 uses this for
+// leader-redirection hints when a client asks the wrong node.
+func (r *Raft) Leader() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.leaderID
+}
+
 // ApplyCh is where committed entries arrive, in increasing CommandIndex order.
 // A later phase feeds these into the KV store's state machine.
 func (r *Raft) ApplyCh() <-chan ApplyMsg { return r.applyCh }
