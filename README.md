@@ -3,10 +3,11 @@
 A distributed, replicated, crash-safe key-value database, built from scratch.
 See `DESIGN.md` for the full plan and `PROGRESS.md` for detailed status.
 
-**Current state: Phase 7** (Layer 2 — Raft). Layer 1 storage engine complete.
-Raft leader election (P4), log replication (P5), and persistence (P6) done.
-In progress: snapshots (P7) — log compaction + InstallSnapshot for followers
-too far behind for normal replication.
+**Current state: Phase 8** (Layer 3 begins). Layer 1 (storage) and Layer 2
+(Raft: election, replication, persistence, snapshots) complete. In progress:
+wiring Raft's committed log to the storage engine as a real state machine
+(internal/node) — a working replicated KV store, minus networking and
+linearizable reads (later phases). See PROGRESS.md for full status.
 
 ## Prerequisites
 
