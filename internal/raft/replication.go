@@ -17,7 +17,7 @@ package raft
 func (r *Raft) buildAppendEntriesArgs(peer int) AppendEntriesArgs {
 	prevIndex := r.nextIndex[peer] - 1
 	prevTerm := r.termAt(prevIndex)
-	entries := append([]LogEntry(nil), r.log[r.nextIndex[peer]:]...) // copy
+	entries := append([]LogEntry(nil), r.log[r.logPos(r.nextIndex[peer]):]...) // copy
 	return AppendEntriesArgs{
 		Term:         r.currentTerm,
 		LeaderID:     r.id,

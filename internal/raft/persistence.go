@@ -11,11 +11,10 @@ package raft
 // that's the real lesson here: knowing exactly which state changes must hit
 // disk before Raft can safely reply to an RPC.
 //
-// See PHASE6.md "Step 1 — persist".
 func (r *Raft) persist() {
-	data, err := encodeState(r.currentTerm, r.votedFor, r.log)
+	data, err := encodeState(r.currentTerm, r.votedFor, r.log, r.snapshotIndex, r.snapshotTerm, r.snapshotData)
 	if err != nil {
-		panic(err) // encoding our own in-memory state should never fail
+		panic(err)
 	}
 	if err := r.persister.Save(data); err != nil {
 		panic(err)

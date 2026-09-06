@@ -138,8 +138,8 @@ func (r *Raft) handleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	for i, e := range args.Entries {
 		idx := insertAt + i
 		if idx <= r.lastLogIndex() {
-			if r.log[idx].Term != e.Term {
-				r.log = r.log[:idx] // discard the conflicting entry and everything after
+			if r.log[r.logPos(idx)].Term != e.Term {
+				r.log = r.log[:r.logPos(idx)] // discard the conflicting entry and everything after
 				r.log = append(r.log, args.Entries[i:]...)
 				break
 			}

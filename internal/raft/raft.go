@@ -65,6 +65,20 @@ type Raft struct {
 
 	persister Persister // Phase 6: durably saves currentTerm/votedFor/log
 
+	// Snapshot state (Phase 7). snapshotIndex/snapshotTerm describe the last
+	// entry summarized by snapshotData; log[0] always represents snapshotIndex
+	// (see log.go). Before any snapshot, snapshotIndex is 0 — the same "nothing
+	// compacted yet" state Phases 1-6 always had.
+	snapshotIndex int
+	snapshotTerm  int
+	snapshotData  []byte
+
+	// pendingSnapshot, when non-nil, is delivered via applyCh on applyLoop's
+	// next pass — set when a snapshot is restored on startup or received via
+	// InstallSnapshot, both cases where the local state machine needs the bytes
+	// handed to it before normal operation continues.
+	pendingSnapshot *ApplyMsg
+
 	lastHeard       time.Time
 	electionTimeout time.Duration
 
@@ -95,10 +109,29 @@ func NewRaft(id int, peers []int, transport Transport, persister Persister) *Raf
 		stopCh:      make(chan struct{}),
 	}
 	if data, err := persister.Load(); err == nil && len(data) > 0 {
-		if term, votedFor, log, derr := decodeState(data); derr == nil {
+		if term, votedFor, log, snapIndex, snapTerm, snapData, derr := decodeState(data); derr == nil {
 			r.currentTerm = term
 			r.votedFor = votedFor
 			r.log = log
+			r.snapshotIndex = snapIndex
+			r.snapshotTerm = snapTerm
+			r.snapshotData = snapData
+			if snapIndex > 0 {
+				// commitIndex/lastApplied are volatile per Figure 2 — but a
+				// snapshot means the log entries below snapIndex no longer
+				// EXIST for applyLoop to walk. Without this, applyLoop would
+				// try to "apply" indices we can no longer read and panic. This
+				// is the one place volatile state must be seeded from
+				// persisted data, not left at zero.
+				r.commitIndex = snapIndex
+				r.lastApplied = snapIndex
+				r.pendingSnapshot = &ApplyMsg{
+					IsSnapshot:    true,
+					SnapshotIndex: snapIndex,
+					SnapshotTerm:  snapTerm,
+					Snapshot:      snapData,
+				}
+			}
 		}
 		// A decode error on existing data means corrupted persisted state — a
 		// real system should fail loudly rather than silently start fresh
@@ -129,12 +162,12 @@ func (r *Raft) GetState() (term int, isLeader bool) {
 func (r *Raft) ApplyCh() <-chan ApplyMsg { return r.applyCh }
 
 // DebugState returns a snapshot of this node's role, term, log length, commit
-// index, and believed leader. Diagnostic only — not used by the protocol
-// itself, just by tests trying to see what's actually going on.
-func (r *Raft) DebugState() (term int, role Role, logLen int, commitIndex int, leaderID int) {
+// index, believed leader, and how far it's snapshotted. Diagnostic only — not
+// used by the protocol itself, just by tests trying to see what's going on.
+func (r *Raft) DebugState() (term int, role Role, logLen int, commitIndex int, leaderID int, snapshotIndex int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.currentTerm, r.role, len(r.log), r.commitIndex, r.leaderID
+	return r.currentTerm, r.role, len(r.log), r.commitIndex, r.leaderID, r.snapshotIndex
 }
 
 // Propose appends command to the leader's own log for replication. Returns the
@@ -171,7 +204,7 @@ func (r *Raft) run() {
 		r.mu.Unlock()
 
 		if role == Leader {
-			r.broadcastAppendEntries()
+			r.broadcastReplication()
 			time.Sleep(heartbeatInterval)
 		} else {
 			if elapsed >= timeout {
@@ -182,8 +215,9 @@ func (r *Raft) run() {
 	}
 }
 
-// applyLoop hands newly committed entries to applyCh in order. It never sends
-// while holding mu: it snapshots what's newly committed, unlocks, then sends.
+// applyLoop hands newly committed entries (and, first, any pending snapshot) to
+// applyCh in order. It never sends while holding mu: it snapshots what's ready,
+// unlocks, then sends.
 func (r *Raft) applyLoop() {
 	for {
 		select {
@@ -193,16 +227,28 @@ func (r *Raft) applyLoop() {
 		}
 
 		r.mu.Lock()
+		var pending *ApplyMsg
+		if r.pendingSnapshot != nil {
+			pending = r.pendingSnapshot
+			r.pendingSnapshot = nil
+		}
 		var toApply []ApplyMsg
 		for r.lastApplied < r.commitIndex {
 			r.lastApplied++
 			toApply = append(toApply, ApplyMsg{
 				CommandIndex: r.lastApplied,
-				Command:      r.log[r.lastApplied].Command,
+				Command:      r.log[r.logPos(r.lastApplied)].Command,
 			})
 		}
 		r.mu.Unlock()
 
+		if pending != nil {
+			select {
+			case r.applyCh <- *pending:
+			case <-r.stopCh:
+				return
+			}
+		}
 		for _, m := range toApply {
 			select {
 			case r.applyCh <- m:
@@ -226,6 +272,59 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.handleAppendEntries(args)
+}
+
+func (r *Raft) InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.handleInstallSnapshot(args)
+}
+
+// handleInstallSnapshot is the follower side of receiving a snapshot: a leader
+// sends this when the entry a follower needs has already been compacted out of
+// the leader's own log. Provided in full — this is the fiddliest single piece
+// of Phase 7 (reconciling local state against an incoming snapshot), matching
+// the project's pattern of providing genuinely hazardous, not-very-instructive
+// slice surgery rather than having you reinvent it.
+//
+// Simplification: this ALWAYS discards the entire local log and replaces it
+// with a fresh sentinel at the snapshot's boundary — even if some of the
+// follower's existing entries were already consistent with the snapshot and
+// could have been kept. The Raft paper (§7) describes that optimization;
+// skipping it is simplest-correct, just not maximally efficient. A good
+// stretch goal once everything else is solid.
+func (r *Raft) handleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	if args.Term > r.currentTerm {
+		r.becomeFollower(args.Term)
+	}
+	reply := InstallSnapshotReply{Term: r.currentTerm}
+	if args.Term < r.currentTerm {
+		return reply // stale leader
+	}
+
+	r.role = Follower
+	r.leaderID = args.LeaderID
+	r.resetElectionTimer()
+
+	if args.LastIncludedIndex <= r.snapshotIndex {
+		return reply // we already have this snapshot (or a newer one) — no-op
+	}
+
+	r.log = []LogEntry{{Term: args.LastIncludedTerm}}
+	r.snapshotIndex = args.LastIncludedIndex
+	r.snapshotTerm = args.LastIncludedTerm
+	r.snapshotData = args.Data
+	r.commitIndex = args.LastIncludedIndex
+	r.lastApplied = args.LastIncludedIndex
+	r.pendingSnapshot = &ApplyMsg{
+		IsSnapshot:    true,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  args.LastIncludedTerm,
+		Snapshot:      args.Data,
+	}
+	r.persist()
+
+	return reply
 }
 
 // --- Provided helpers ---
@@ -297,11 +396,13 @@ func (r *Raft) requestVotesFromPeers(args RequestVoteArgs) int {
 	return granted
 }
 
-// broadcastAppendEntries sends AppendEntries to every peer, built per-peer via
-// your buildAppendEntriesArgs (replication.go). Handles the network fan-out and
-// higher-term step-down; hands a normal-term reply to your
-// handleAppendEntriesReply for the actual replication/commit decisions.
-func (r *Raft) broadcastAppendEntries() {
+// broadcastReplication sends each peer either an InstallSnapshot (if
+// needsSnapshot says the peer's needed entry has been compacted away — your
+// call in snapshot.go) or a normal AppendEntries (Phase 5's path, unchanged).
+// Handles the network fan-out and higher-term step-down for both; hands a
+// normal-term reply to your handleInstallSnapshotReply or
+// handleAppendEntriesReply for the actual bookkeeping decisions.
+func (r *Raft) broadcastReplication() {
 	r.mu.Lock()
 	if r.role != Leader {
 		r.mu.Unlock()
@@ -317,6 +418,26 @@ func (r *Raft) broadcastAppendEntries() {
 				r.mu.Unlock()
 				return
 			}
+
+			if r.needsSnapshot(peer) { // YOU implement (snapshot.go)
+				args := r.buildInstallSnapshotArgs() // YOU implement (snapshot.go)
+				r.mu.Unlock()
+
+				reply, ok := r.transport.SendInstallSnapshot(peer, args)
+				if !ok {
+					return
+				}
+				r.mu.Lock()
+				if reply.Term > r.currentTerm {
+					r.becomeFollower(reply.Term)
+					r.mu.Unlock()
+					return
+				}
+				r.handleInstallSnapshotReply(peer, args, reply) // YOU implement
+				r.mu.Unlock()
+				return
+			}
+
 			args := r.buildAppendEntriesArgs(peer) // YOU implement (replication.go)
 			r.mu.Unlock()
 

@@ -7,17 +7,10 @@ import (
 	"sync"
 )
 
-// Persister is how a Raft node durably saves and reloads currentTerm, votedFor,
-// and its log. Two implementations are provided: MemoryPersister (used by
-// tests — fast, no real disk I/O, but still round-trips through real encoding)
-// and FilePersister (real disk, atomic write via temp-file + rename, the same
-// crash-safety pattern your Layer 1 SSTable writer uses).
 type Persister interface {
 	Save(state []byte) error
-	Load() ([]byte, error) // returns (nil, nil) if nothing has been saved yet
+	Load() ([]byte, error)
 }
-
-// --- MemoryPersister: in-memory, for tests ---
 
 type MemoryPersister struct {
 	mu    sync.Mutex
@@ -29,7 +22,7 @@ func NewMemoryPersister() *MemoryPersister { return &MemoryPersister{} }
 func (p *MemoryPersister) Save(state []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.state = append([]byte(nil), state...) // copy: never alias the caller's slice
+	p.state = append([]byte(nil), state...)
 	return nil
 }
 
@@ -41,8 +34,6 @@ func (p *MemoryPersister) Load() ([]byte, error) {
 	}
 	return append([]byte(nil), p.state...), nil
 }
-
-// --- FilePersister: real disk, for actual deployment ---
 
 type FilePersister struct {
 	mu   sync.Mutex
@@ -83,46 +74,38 @@ func (p *FilePersister) Load() ([]byte, error) {
 	return data, err
 }
 
-// --- Encoding: currentTerm + votedFor + log, via Go's gob encoder ---
-//
-// Layer 1's WAL/SSTable formats were hand-rolled on purpose, to see exactly how
-// the bytes work. Here we reach for encoding/gob instead, because LogEntry.Command
-// is `interface{}` — its concrete type varies (a string in our tests today; a
-// real command struct once Phase 8 wires this to the KV store). Hand-rolling a
-// format for an open-ended set of types is real effort with little extra
-// learning value; gob handles it, and it's what real Go Raft implementations
-// (including the reference MIT 6.824 solution) actually use for exactly this.
-//
-// gob.Register tells the encoder which concrete type an interface{} value holds.
-// Forget to register a type and encoding/decoding it panics — a genuine gotcha,
-// and the reason this init() exists. When Phase 8 introduces a real Command
-// type, register it here too.
 func init() {
 	gob.Register("")
 }
 
 type persistentState struct {
-	CurrentTerm int
-	VotedFor    int
-	Log         []LogEntry
+	CurrentTerm   int
+	VotedFor      int
+	Log           []LogEntry
+	SnapshotIndex int
+	SnapshotTerm  int
+	SnapshotData  []byte
 }
 
-func encodeState(term, votedFor int, log []LogEntry) ([]byte, error) {
+func encodeState(term, votedFor int, log []LogEntry, snapshotIndex, snapshotTerm int, snapshotData []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(persistentState{
-		CurrentTerm: term,
-		VotedFor:    votedFor,
-		Log:         log,
+		CurrentTerm:   term,
+		VotedFor:      votedFor,
+		Log:           log,
+		SnapshotIndex: snapshotIndex,
+		SnapshotTerm:  snapshotTerm,
+		SnapshotData:  snapshotData,
 	}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-func decodeState(data []byte) (term int, votedFor int, log []LogEntry, err error) {
+func decodeState(data []byte) (term int, votedFor int, log []LogEntry, snapshotIndex int, snapshotTerm int, snapshotData []byte, err error) {
 	var ps persistentState
 	if err = gob.NewDecoder(bytes.NewReader(data)).Decode(&ps); err != nil {
-		return 0, -1, nil, err
+		return 0, -1, nil, 0, 0, nil, err
 	}
-	return ps.CurrentTerm, ps.VotedFor, ps.Log, nil
+	return ps.CurrentTerm, ps.VotedFor, ps.Log, ps.SnapshotIndex, ps.SnapshotTerm, ps.SnapshotData, nil
 }

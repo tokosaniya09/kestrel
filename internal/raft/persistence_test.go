@@ -5,9 +5,6 @@ import (
 	"time"
 )
 
-// noopTransport delivers nothing — used for single-node tests that don't need a
-// real cluster, just a Raft instance to poke directly via its exported RPC entry
-// points.
 type noopTransport struct{}
 
 func (noopTransport) SendRequestVote(int, RequestVoteArgs) (RequestVoteReply, bool) {
@@ -16,9 +13,10 @@ func (noopTransport) SendRequestVote(int, RequestVoteArgs) (RequestVoteReply, bo
 func (noopTransport) SendAppendEntries(int, AppendEntriesArgs) (AppendEntriesReply, bool) {
 	return AppendEntriesReply{}, false
 }
+func (noopTransport) SendInstallSnapshot(int, InstallSnapshotArgs) (InstallSnapshotReply, bool) {
+	return InstallSnapshotReply{}, false
+}
 
-// A restarted node must recover its term and log exactly as they were, and must
-// come back as a plain follower (role/commitIndex are volatile — never persisted).
 func TestPersistAcrossRestart(t *testing.T) {
 	c := makeCluster(3)
 	defer c.stopAll()
@@ -41,11 +39,11 @@ func TestPersistAcrossRestart(t *testing.T) {
 		t.Fatal("commands should commit before restart")
 	}
 
-	beforeTerm, _, beforeLogLen, _, _ := c.rafts[follower].DebugState()
+	beforeTerm, _, beforeLogLen, _, _, _ := c.rafts[follower].DebugState()
 
 	c.restart(follower)
 
-	afterTerm, afterRole, afterLogLen, _, _ := c.rafts[follower].DebugState()
+	afterTerm, afterRole, afterLogLen, _, _, _ := c.rafts[follower].DebugState()
 	if afterRole != Follower {
 		t.Fatalf("a restarted node must come back as a follower, got %s", afterRole)
 	}
@@ -56,27 +54,20 @@ func TestPersistAcrossRestart(t *testing.T) {
 		t.Fatalf("log not persisted: had %d entries before restart, have %d after", beforeLogLen, afterLogLen)
 	}
 
-	// The leader never crashed, so once heartbeats resume, the restarted node
-	// should quickly relearn the commit index from its own (already-intact) log
-	// — commitIndex is volatile and legitimately resets to 0 on restart, but the
-	// data needed to recompute it (the log) survived.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		_, _, _, commit, _ := c.rafts[follower].DebugState()
+		_, _, _, commit, _, _ := c.rafts[follower].DebugState()
 		if commit >= 3 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	_, _, _, finalCommit, _ := c.rafts[follower].DebugState()
+	_, _, _, finalCommit, _, _ := c.rafts[follower].DebugState()
 	if finalCommit < 3 {
 		t.Fatalf("restarted node never relearned its commit index: %d", finalCommit)
 	}
 }
 
-// The property persistence actually exists to protect: a node must never grant
-// a second, conflicting vote in a term it already voted in — even across a
-// crash and restart.
 func TestNoDoubleVoteAcrossRestart(t *testing.T) {
 	mp := NewMemoryPersister()
 	r := NewRaft(0, []int{0, 1, 2}, noopTransport{}, mp)
@@ -88,7 +79,6 @@ func TestNoDoubleVoteAcrossRestart(t *testing.T) {
 	}
 	r.Stop()
 
-	// Same persister = simulates this node crashing and coming back.
 	r2 := NewRaft(0, []int{0, 1, 2}, noopTransport{}, mp)
 	r2.Start()
 	defer r2.Stop()
@@ -99,8 +89,6 @@ func TestNoDoubleVoteAcrossRestart(t *testing.T) {
 	}
 }
 
-// A restarted leader comes back as a follower; the cluster must re-elect and
-// keep making progress.
 func TestClusterSurvivesLeaderRestart(t *testing.T) {
 	c := makeCluster(3)
 	defer c.stopAll()

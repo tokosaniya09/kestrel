@@ -8,25 +8,50 @@ type LogEntry struct {
 	Command interface{}
 }
 
-// ApplyMsg is a committed entry handed to the state machine. A later phase wires
-// this into the KV store; for now, tests just read it off ApplyCh().
+// ApplyMsg is either a normal committed entry OR a snapshot the state machine
+// must install wholesale. Exactly one of the two shapes is populated:
+//   - a command:  CommandIndex/Command set, IsSnapshot false
+//   - a snapshot: IsSnapshot true, SnapshotIndex/SnapshotTerm/Snapshot set
+//
+// Only a node that RECEIVES a snapshot via InstallSnapshot (because it fell too
+// far behind for normal replication) or LOADS one on restart gets one of these —
+// calling Snapshot() locally does NOT emit one, since the caller (the state
+// machine) already has that data; it's the one who just told Raft about it.
 type ApplyMsg struct {
 	CommandIndex int
 	Command      interface{}
+
+	IsSnapshot    bool
+	SnapshotIndex int
+	SnapshotTerm  int
+	Snapshot      []byte
 }
 
-// The log is 1-INDEXED: log[0] is a sentinel (Term 0, no command). That makes
-// "no real entries yet" naturally give lastLogIndex() == 0, lastLogTerm() == 0 —
-// no special-casing needed at the boundaries.
+// The log is a SLICE whose position 0 does not necessarily represent raft-index
+// 0 anymore. log[0] is always a sentinel entry — before any snapshot, it
+// represents index 0 (Term 0, no command, exactly as in Phases 1-6); after
+// Snapshot(index, ...) or receiving an InstallSnapshot, it represents whatever
+// index was last snapshotted, with that entry's real term. r.snapshotIndex
+// tracks which raft-index log[0] currently stands for — every other function in
+// this file goes through logPos to translate, so callers elsewhere never need
+// to know this offset exists.
 
-func (r *Raft) lastLogIndex() int { return len(r.log) - 1 }
+// logPos converts a raft-log-index into a position in the log SLICE.
+func (r *Raft) logPos(index int) int { return index - r.snapshotIndex }
 
-func (r *Raft) lastLogTerm() int { return r.log[r.lastLogIndex()].Term }
+func (r *Raft) lastLogIndex() int { return r.snapshotIndex + len(r.log) - 1 }
 
-// termAt returns the term of the entry at index, or -1 if index is out of range.
+func (r *Raft) lastLogTerm() int { return r.log[len(r.log)-1].Term }
+
+// termAt returns the term of the entry at index, or -1 if we don't have it —
+// either because it's been compacted away by a snapshot, or because it's
+// beyond the end of our log. Either way, -1 safely fails any consistency check
+// that uses it, which is exactly the correct (if sometimes inefficient)
+// behavior: never guess, only ever compare against data we actually hold.
 func (r *Raft) termAt(index int) int {
-	if index < 0 || index >= len(r.log) {
+	pos := r.logPos(index)
+	if pos < 0 || pos >= len(r.log) {
 		return -1
 	}
-	return r.log[index].Term
+	return r.log[pos].Term
 }

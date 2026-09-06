@@ -1,14 +1,11 @@
 package raft
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
 )
-
-// An in-memory cluster + network for tests. A node marked "down" can neither
-// send nor receive RPCs (in either direction) — that models a crash or a
-// partition that fully isolates it.
 
 type network struct {
 	mu    sync.Mutex
@@ -66,6 +63,20 @@ func (n *network) rpcAE(from, to int, a AppendEntriesArgs) (AppendEntriesReply, 
 	return target.AppendEntries(a), true
 }
 
+func (n *network) rpcIS(from, to int, a InstallSnapshotArgs) (InstallSnapshotReply, bool) {
+	n.mu.Lock()
+	if n.down[from] || n.down[to] {
+		n.mu.Unlock()
+		return InstallSnapshotReply{}, false
+	}
+	target := n.nodes[to]
+	n.mu.Unlock()
+	if target == nil {
+		return InstallSnapshotReply{}, false
+	}
+	return target.InstallSnapshot(a), true
+}
+
 type inmemTransport struct {
 	net  *network
 	from int
@@ -77,16 +88,19 @@ func (t *inmemTransport) SendRequestVote(to int, a RequestVoteArgs) (RequestVote
 func (t *inmemTransport) SendAppendEntries(to int, a AppendEntriesArgs) (AppendEntriesReply, bool) {
 	return t.net.rpcAE(t.from, to, a)
 }
+func (t *inmemTransport) SendInstallSnapshot(to int, a InstallSnapshotArgs) (InstallSnapshotReply, bool) {
+	return t.net.rpcIS(t.from, to, a)
+}
 
 type cluster struct {
 	net        *network
 	rafts      map[int]*Raft
-	persisters map[int]Persister // Phase 6: kept alive across restart() calls
+	persisters map[int]Persister
 	peers      []int
 	n          int
 
 	appliedMu sync.Mutex
-	applied   map[int][]ApplyMsg // per-node, in the order each node applied them
+	applied   map[int][]ApplyMsg
 }
 
 func makeCluster(n int) *cluster {
@@ -117,8 +131,6 @@ func makeCluster(n int) *cluster {
 	return c
 }
 
-// drainApplied copies every committed entry a node produces into c.applied, so
-// tests can inspect what each node has actually applied, in order.
 func (c *cluster) drainApplied(id int, r *Raft) {
 	for m := range r.ApplyCh() {
 		c.appliedMu.Lock()
@@ -135,17 +147,10 @@ func (c *cluster) crash(id int) {
 	c.rafts[id].Stop()
 }
 
-// restart simulates the node at id crashing and coming back: the OLD Raft
-// instance is stopped, and a BRAND NEW one is built from scratch — reusing the
-// SAME persister, so it recovers exactly the currentTerm/votedFor/log that were
-// durably saved, and nothing else (role, commitIndex, etc. start fresh, as they
-// should). It's re-registered in the network under the same id so RPCs route to
-// the new instance transparently, and gets its own fresh drainApplied goroutine
-// since it has a brand new ApplyCh.
 func (c *cluster) restart(id int) {
 	c.rafts[id].Stop()
 	newRaft := NewRaft(id, c.peers, &inmemTransport{net: c.net, from: id}, c.persisters[id])
-	c.net.add(id, newRaft) // overwrite: RPCs to this id now reach the new instance
+	c.net.add(id, newRaft)
 	c.rafts[id] = newRaft
 	newRaft.Start()
 	go c.drainApplied(id, newRaft)
@@ -157,8 +162,6 @@ func (c *cluster) stopAll() {
 	}
 }
 
-// checkOneLeader waits for the cluster to settle and asserts exactly one leader
-// exists in the highest term seen among connected nodes. Returns that leader's id.
 func (c *cluster) checkOneLeader(t *testing.T) int {
 	t.Helper()
 	for attempt := 0; attempt < 10; attempt++ {
@@ -191,7 +194,6 @@ func (c *cluster) checkOneLeader(t *testing.T) int {
 	return -1
 }
 
-// checkNoLeader asserts that no connected node considers itself leader.
 func (c *cluster) checkNoLeader(t *testing.T) {
 	t.Helper()
 	time.Sleep(500 * time.Millisecond)
@@ -205,8 +207,6 @@ func (c *cluster) checkNoLeader(t *testing.T) {
 	}
 }
 
-// waitApplied polls until a majority of nodes have applied at least minCount
-// entries, or the timeout elapses.
 func (c *cluster) waitApplied(minCount int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -233,15 +233,27 @@ func (c *cluster) appliedCount(id int) int {
 	return len(c.applied[id])
 }
 
-// dump logs every node's term/role/log length/commit/leader-belief, for
-// diagnosing exactly what a cluster is doing when a test misbehaves. Go's
-// testing framework always prints t.Log output for a FAILING test, so this
-// shows up automatically on failure without needing -v.
+// hasAppliedSnapshot reports whether node id's applied list already contains a
+// snapshot message matching want. (drainApplied is the only consumer of a
+// node's ApplyCh — reading it a second way, e.g. directly in a test, would race
+// with that goroutine for each message; this checks the same recorded copy
+// drainApplied already keeps instead.)
+func (c *cluster) hasAppliedSnapshot(id int, want []byte) bool {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	for _, m := range c.applied[id] {
+		if m.IsSnapshot && bytes.Equal(m.Snapshot, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *cluster) dump(t *testing.T, label string) {
 	t.Helper()
 	for id := 0; id < c.n; id++ {
-		term, role, logLen, commit, leaderID := c.rafts[id].DebugState()
-		t.Logf("[%s] node %d: term=%d role=%s logLen=%d commitIndex=%d leaderID=%d down=%v",
-			label, id, term, role, logLen, commit, leaderID, c.net.isDown(id))
+		term, role, logLen, commit, leaderID, snapIndex := c.rafts[id].DebugState()
+		t.Logf("[%s] node %d: term=%d role=%s logLen=%d commitIndex=%d leaderID=%d snapshotIndex=%d down=%v",
+			label, id, term, role, logLen, commit, leaderID, snapIndex, c.net.isDown(id))
 	}
 }
