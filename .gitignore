@@ -1,6 +1,8 @@
 # runtime data
 /data/
+/clusterdata/
 
 # built binaries
+/bin/
 /kestrel
 /kestrel.exe
