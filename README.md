@@ -3,11 +3,20 @@
 A distributed, replicated, crash-safe key-value database, built from scratch.
 See `DESIGN.md` for the full plan and `PROGRESS.md` for detailed status.
 
-**Current state: Phase 9** (Layer 3). Layer 1, Layer 2, and Phase 8 (state
-machine integration) complete. In progress: a real network Transport
-(internal/rpc) over TCP via net/rpc, replacing the in-memory fake every
-earlier phase's tests used — zero changes needed to the raft package itself.
-See PROGRESS.md for full status.
+**Current state: runnable.** Layers 1-3 are built and a real cluster can be
+started as separate OS processes — see **RUNNING.md** to spin one up and try
+it. Remaining: linearizable reads (ReadIndex), installing snapshots into the
+state machine, the deferred storage manifest, and dynamic membership. See
+PROGRESS.md for full status.
+
+## Quick start
+
+```bash
+go build -o bin/kestrel-server ./cmd/kestrel-server
+go build -o bin/kestrel-cli ./cmd/kestrel-cli
+```
+
+Then start three nodes and a client — full instructions in `RUNNING.md`.
 
 ## Prerequisites
 
