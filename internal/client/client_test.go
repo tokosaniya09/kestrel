@@ -1,78 +1,173 @@
 package client
+
 import (
-	"fmt" 
-	"kestrel/internal/rpc"
+	"net"
+	"testing"
 	"time"
+
+	"kestrel/internal/node"
+	"kestrel/internal/raft"
+	"kestrel/internal/rpc"
+	"kestrel/internal/storage"
 )
 
-// This is your Phase 10 implementation file: three methods. Put and Delete
-// share an identical shape (chase the leader, following redirects until one
-// succeeds). Get does NOT need that shape at all — see PHASE10.md for why
-// that asymmetry is correct, not an oversight, and directly follows from a
-// decision made back in Phase 8.
-//
-func (c *Client) Put(key, value []byte) error {
-	args := rpc.PutArgs{Key: key, Value: value}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		id, addr, ok := c.currentTarget()
-		if !ok {
-			return fmt.Errorf("no known cluster nodes")
-		}
+// This test file is package client (not client_test) deliberately, for one
+// test specifically: TestClientFollowsRedirectFromWrongGuess needs to force a
+// KNOWN wrong first guess to test the redirect path deterministically, rather
+// than hoping round-robin happens to pick the wrong node on a given run.
 
-		var reply rpc.PutReply
-		if !tryCall(addr, "KVService.Put", args, &reply) {
-			c.advance() // unreachable — try someone else next time
-			time.Sleep(retryDelay)
-			continue
-		}
-		if reply.Success {
-			c.noteWorking(id)
-			return nil
-		}
-		c.setLeaderHint(reply.LeaderHint) // follow the redirect
-		time.Sleep(retryDelay)
-	}
-	return fmt.Errorf("put failed after %d attempts", maxAttempts)
+type testCluster struct {
+	rafts     []*raft.Raft
+	dbs       []*storage.DB
+	listeners []net.Listener
+	addrs     map[int]string
 }
 
-func (c *Client) Delete(key []byte) error {
-	args := rpc.DeleteArgs{Key: key}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		id, addr, ok := c.currentTarget()
-		if !ok {
-			return fmt.Errorf("no known cluster nodes")
-		}
-
-		var reply rpc.DeleteReply
-		if !tryCall(addr, "KVService.Delete", args, &reply) {
-			c.advance()
-			time.Sleep(retryDelay)
-			continue
-		}
-		if reply.Success {
-			c.noteWorking(id)
-			return nil
-		}
-		c.setLeaderHint(reply.LeaderHint)
-		time.Sleep(retryDelay)
+func makeTestCluster(t *testing.T, n int) *testCluster {
+	t.Helper()
+	peers := make([]int, n)
+	for i := range peers {
+		peers[i] = i
 	}
-	return fmt.Errorf("delete failed after %d attempts", maxAttempts)
+
+	addrs := map[int]string{}
+	transport := rpc.NewRPCTransport(addrs)
+
+	tc := &testCluster{addrs: addrs}
+	for i := 0; i < n; i++ {
+		db, err := storage.Open(t.TempDir())
+		if err != nil {
+			t.Fatalf("storage.Open: %v", err)
+		}
+		r := raft.NewRaft(i, peers, transport, raft.NewMemoryPersister())
+		nd := node.NewNode(r, db)
+		listener, err := rpc.ServeNode(r, nd, "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("ServeNode: %v", err)
+		}
+		addrs[i] = listener.Addr().String()
+		tc.rafts = append(tc.rafts, r)
+		tc.dbs = append(tc.dbs, db)
+		tc.listeners = append(tc.listeners, listener)
+		r.Start()
+	}
+	t.Cleanup(func() {
+		// Order matters: stop Raft and close listeners FIRST, so no apply loop
+		// or in-flight RPC can touch a DB we're about to close. Only then
+		// release the storage engines — on Windows an open file handle makes
+		// t.TempDir()'s RemoveAll fail, which is exactly what this ordering
+		// (and the previously-missing db.Close) prevents.
+		for _, r := range tc.rafts {
+			r.Stop()
+		}
+		for _, l := range tc.listeners {
+			l.Close()
+		}
+		time.Sleep(50 * time.Millisecond) // let in-flight goroutines wind down
+		for _, db := range tc.dbs {
+			db.Close()
+		}
+	})
+	return tc
 }
 
-func (c *Client) Get(key []byte) ([]byte, bool, error) {
-	args := rpc.GetArgs{Key: key}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		id, addr, ok := c.currentTarget()
-		if !ok {
-			return nil, false, fmt.Errorf("no known cluster nodes")
+func (tc *testCluster) waitForLeader(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, r := range tc.rafts {
+			if _, isLeader := r.GetState(); isLeader {
+				return i
+			}
 		}
-		var reply rpc.GetReply
-		if tryCall(addr, "KVService.Get", args, &reply) {
-			c.noteWorking(id)
-			return reply.Value, reply.Found, nil
-		}
-		c.advance()
-		time.Sleep(retryDelay)
+		time.Sleep(50 * time.Millisecond)
 	}
-	return nil, false, fmt.Errorf("get failed after %d attempts", maxAttempts)
+	t.Fatal("no leader elected")
+	return -1
+}
+
+// A client that starts knowing nothing about who's leader must still succeed
+// at a full Put/Get/Delete round trip.
+func TestClientPutGetDelete(t *testing.T) {
+	tc := makeTestCluster(t, 3)
+	tc.waitForLeader(t)
+
+	c := New(tc.addrs)
+
+	if err := c.Put([]byte("name"), []byte("toko")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	v, found, err := c.Get([]byte("name"))
+	if err != nil || !found || string(v) != "toko" {
+		t.Fatalf("Get: v=%q found=%v err=%v", v, found, err)
+	}
+	if err := c.Delete([]byte("name")); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	_, found, err = c.Get([]byte("name"))
+	if err != nil || found {
+		t.Fatalf("expected key gone after Delete: found=%v err=%v", found, err)
+	}
+}
+
+// Forcing a deliberately WRONG first guess (white-box, on purpose — this is
+// the one place this test file needs unexported access) must still succeed,
+// by following the redirect the wrong node hands back.
+func TestClientFollowsRedirectFromWrongGuess(t *testing.T) {
+	tc := makeTestCluster(t, 3)
+	leaderID := tc.waitForLeader(t)
+	var wrongGuess int
+	for id := range tc.addrs {
+		if id != leaderID {
+			wrongGuess = id
+			break
+		}
+	}
+
+	c := New(tc.addrs)
+	c.leader = wrongGuess // deterministic wrong guess
+
+	if err := c.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put should have succeeded after following the redirect: %v", err)
+	}
+	v, found, err := c.Get([]byte("k"))
+	if err != nil || !found || string(v) != "v" {
+		t.Fatalf("Get after redirect-following Put: v=%q found=%v err=%v", v, found, err)
+	}
+}
+
+// The same Client instance, having cached a leader guess that's now dead,
+// must recover and keep working after a real leader failover.
+func TestClientSurvivesLeaderFailover(t *testing.T) {
+	tc := makeTestCluster(t, 3)
+	leaderID := tc.waitForLeader(t)
+
+	c := New(tc.addrs)
+	if err := c.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatalf("initial Put failed: %v", err)
+	}
+
+	tc.rafts[leaderID].Stop()
+	tc.listeners[leaderID].Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	newLeaderFound := false
+	for time.Now().Before(deadline) && !newLeaderFound {
+		for i, r := range tc.rafts {
+			if i == leaderID {
+				continue
+			}
+			if _, isLeader := r.GetState(); isLeader {
+				newLeaderFound = true
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !newLeaderFound {
+		t.Fatal("no new leader elected after failover")
+	}
+
+	if err := c.Put([]byte("b"), []byte("2")); err != nil {
+		t.Fatalf("Put after failover should have succeeded: %v", err)
+	}
 }
