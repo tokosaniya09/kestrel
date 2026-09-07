@@ -36,7 +36,27 @@ func (c *Client) Put(key, value []byte) error {
 }
 
 func (c *Client) Delete(key []byte) error {
-	panic("TODO: implement Delete — see PHASE10.md")
+	args := rpc.DeleteArgs{Key: key}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		id, addr, ok := c.currentTarget()
+		if !ok {
+			return fmt.Errorf("no known cluster nodes")
+		}
+
+		var reply rpc.DeleteReply
+		if !tryCall(addr, "KVService.Delete", args, &reply) {
+			c.advance()
+			time.Sleep(retryDelay)
+			continue
+		}
+		if reply.Success {
+			c.noteWorking(id)
+			return nil
+		}
+		c.setLeaderHint(reply.LeaderHint)
+		time.Sleep(retryDelay)
+	}
+	return fmt.Errorf("delete failed after %d attempts", maxAttempts)
 }
 
 func (c *Client) Get(key []byte) ([]byte, bool, error) {
