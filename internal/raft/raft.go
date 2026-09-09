@@ -405,12 +405,11 @@ func (r *Raft) requestVotesFromPeers(args RequestVoteArgs) int {
 	return granted
 }
 
-// broadcastReplication sends each peer either an InstallSnapshot (if
-// needsSnapshot says the peer's needed entry has been compacted away — your
-// call in snapshot.go) or a normal AppendEntries (Phase 5's path, unchanged).
-// Handles the network fan-out and higher-term step-down for both; hands a
-// normal-term reply to your handleInstallSnapshotReply or
-// handleAppendEntriesReply for the actual bookkeeping decisions.
+// broadcastReplication sends each peer either an InstallSnapshot (when the
+// entry that peer needs next has already been compacted out of our log) or a
+// normal AppendEntries. It handles the network fan-out and higher-term
+// step-down for both, then hands a normal-term reply to
+// handleInstallSnapshotReply or handleAppendEntriesReply for the bookkeeping.
 func (r *Raft) broadcastReplication() {
 	r.mu.Lock()
 	if r.role != Leader {
@@ -428,8 +427,8 @@ func (r *Raft) broadcastReplication() {
 				return
 			}
 
-			if r.needsSnapshot(peer) { // YOU implement (snapshot.go)
-				args := r.buildInstallSnapshotArgs() // YOU implement (snapshot.go)
+			if r.needsSnapshot(peer) {
+				args := r.buildInstallSnapshotArgs()
 				r.mu.Unlock()
 
 				reply, ok := r.transport.SendInstallSnapshot(peer, args)
@@ -442,12 +441,12 @@ func (r *Raft) broadcastReplication() {
 					r.mu.Unlock()
 					return
 				}
-				r.handleInstallSnapshotReply(peer, args, reply) // YOU implement
+				r.handleInstallSnapshotReply(peer, args, reply)
 				r.mu.Unlock()
 				return
 			}
 
-			args := r.buildAppendEntriesArgs(peer) // YOU implement (replication.go)
+			args := r.buildAppendEntriesArgs(peer)
 			r.mu.Unlock()
 
 			reply, ok := r.transport.SendAppendEntries(peer, args)
@@ -461,17 +460,15 @@ func (r *Raft) broadcastReplication() {
 				r.mu.Unlock()
 				return
 			}
-			r.handleAppendEntriesReply(peer, args, reply) // YOU implement
+			r.handleAppendEntriesReply(peer, args, reply)
 			r.mu.Unlock()
 		}(peer)
 	}
 }
 
-// confirmStillLeader sends a heartbeat round and reports whether a MAJORITY of
-// the cluster acknowledged this node as leader at `term`. Provided — this is
-// the same concurrent fan-out pattern as requestVotesFromPeers, and it is the
-// mechanism that turns "I believe I'm the leader" into "a majority just now
-// confirmed I'm the leader."
+// confirmStillLeader sends a heartbeat round and reports whether a majority of
+// the cluster acknowledged this node as leader at term. It is what turns "I
+// believe I'm the leader" into "a majority just now confirmed I'm the leader."
 //
 // Why that distinction matters: a partitioned leader does NOT know it's been
 // deposed — nothing informs it. It would keep answering reads from state
@@ -539,8 +536,8 @@ func (r *Raft) confirmStillLeader(term int) bool {
 }
 
 // waitForApplied blocks until lastApplied reaches at least index, or timeout
-// elapses. Provided — a simple poll, matching the tick-based style of
-// applyLoop rather than introducing condition variables.
+// elapses. A simple poll, matching the tick-based style of applyLoop rather
+// than introducing condition variables.
 func (r *Raft) waitForApplied(index int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

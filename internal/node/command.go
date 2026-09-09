@@ -10,16 +10,15 @@ const (
 	OpDelete
 )
 
-// Command is what actually flows through Raft's log now — replacing the plain
-// strings your raft package's own tests used as a stand-in. This is exactly
-// the concrete type Phase 6's gob.Register gotcha was warning you about:
-// LogEntry.Command is `interface{}`, and gob needs to know every concrete type
-// that might show up inside it.
+// Command is what flows through Raft's log. LogEntry.Command is an
+// interface{}, and gob needs to know every concrete type that can appear
+// inside one — hence the registration below.
 //
-// ID exists for one specific reason: to tell "my command" apart from "a
-// different command that happened to land at the same log index" once
-// leadership changes are in the mix. See PHASE8.md for why index alone isn't
-// enough.
+// ID distinguishes "my command" from "a different command that happened to
+// land at the same log index". Propose returns an index, not a guarantee: if
+// leadership changes before that index commits, another client's command can
+// end up occupying it, so a caller that only checked the index would wrongly
+// report success for a write that never happened.
 type Command struct {
 	ID    uint64
 	Op    CommandOp

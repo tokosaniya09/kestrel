@@ -1,16 +1,14 @@
 package raft
+
 import "fmt"
 
-// This is your Phase 7 implementation file: four functions. Three run under
-// r.mu (their callers hold the lock — same discipline as replication.go); one,
-// Snapshot(), is the public entry point an application (the eventual KV store)
-// calls, and takes the lock itself.
+// Log compaction. Snapshot is the public entry point an application calls and
+// takes r.mu itself; the other three are leader-side decisions called with the
+// lock already held.
 //
-// The fiddly index-translation plumbing (logPos, and the follower-side
-// handleInstallSnapshot) is provided. What's yours is the genuinely
-// Raft-specific decision-making: when a node should summarize its own log, when
-// a LEADER realizes a given follower needs a snapshot instead of a normal
-// AppendEntries, and how to update leader bookkeeping once one's been sent.
+// The index translation that makes compaction possible (logPos and friends)
+// lives in log.go; the follower side of receiving a snapshot is
+// handleInstallSnapshot in raft.go.
 
 // Snapshot tells this Raft node that the application has durably captured
 // everything through index (as data) and it's safe to discard log entries up to

@@ -1,16 +1,17 @@
 package raft
 
-// This is your Phase 6 implementation file: ONE method. Runs under r.mu (every
-// caller already holds the lock) — you write pure logic, no goroutines, no I/O
-// concerns beyond calling the provided persister.
+// persist writes the durable half of Raft's state — currentTerm, votedFor, the
+// log, and any snapshot — through the Persister. Callers already hold r.mu.
 //
-// You are NOT responsible for deciding WHERE persist() gets called from
-// raft.go's provided code — becomeFollower and Propose already call it, since
-// they live in files you don't own this phase. You WILL find three more call
-// sites to add yourself, in your own election.go (see PHASE6.md "Step 2") —
-// that's the real lesson here: knowing exactly which state changes must hit
-// disk before Raft can safely reply to an RPC.
+// It is called from every point that mutates that state: becomeFollower and
+// Propose (raft.go), and startElection, handleRequestVote, and
+// handleAppendEntries (election.go). Each of those must reach disk before Raft
+// replies to an RPC, or a crash could let the node contradict itself on
+// restart — voting twice in one term, or losing an entry it already
+// acknowledged.
 //
+// A failure here panics deliberately: a node that cannot record its own
+// safety-critical state cannot safely keep participating.
 func (r *Raft) persist() {
 	data, err := encodeState(r.currentTerm, r.votedFor, r.log, r.snapshotIndex, r.snapshotTerm, r.snapshotData)
 	if err != nil {

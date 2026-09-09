@@ -2,12 +2,9 @@ package raft
 
 import "time"
 
-// This is your Phase 11 implementation file: ONE method, and it takes its own
-// lock (unlike election.go/replication.go/snapshot.go, whose callers lock for
-// them) — because it needs to RELEASE the lock partway through to send
-// heartbeats, the same discipline as startElection.
-//
-// See PHASE11.md for the full walkthrough.
+// The ReadIndex protocol, which makes linearizable reads possible without
+// writing to the log. ReadIndex takes r.mu itself, since it must release the
+// lock partway through to send heartbeats.
 
 const readIndexTimeout = 2 * time.Second
 
@@ -18,18 +15,22 @@ type readIndexError string
 func (e readIndexError) Error() string { return string(e) }
 
 const (
-	ErrNotLeader    = readIndexError("not the leader")
+	ErrNotLeader        = readIndexError("not the leader")
 	ErrReadIndexTimeout = readIndexError("timed out establishing a read index")
 )
 
-// ReadIndex implements the ReadIndex protocol: it returns only once this node
-// has PROVEN it can serve a linearizable read, i.e. once it has established
-// that its state machine reflects everything committed before the read began.
+// ReadIndex returns only once this node has proven it can serve a linearizable
+// read: that its state machine reflects everything committed before the read
+// began. The caller then reads local state normally — the guarantee comes from
+// having waited here first, not from anything special about the read itself.
 //
-// The caller (node.Node.Get, once you wire it up) then reads its local state
-// machine normally — the guarantee comes from having waited here first, not
-// from anything special about the read itself.
-//
+// Two things can make a local read stale, and each step addresses one. A
+// follower may not have applied a committed entry yet, so we wait for
+// lastApplied to reach the commitIndex captured at the start. And a
+// partitioned leader has no way to learn it has been deposed, so it would
+// happily serve state frozen at the moment of the partition — confirming a
+// fresh majority ack rules that out, since any two majorities overlap and a
+// node at a higher term rejects the heartbeat rather than acking it.
 func (r *Raft) ReadIndex() error {
 	r.mu.Lock()
 	if r.role != Leader {

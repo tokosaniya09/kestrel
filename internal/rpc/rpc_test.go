@@ -5,13 +5,14 @@ import (
 	"testing"
 	"time"
 
+	"kestrel/internal/node"
 	"kestrel/internal/raft"
+	"kestrel/internal/storage"
 )
 
-// This test replicates commands over REAL TCP sockets on localhost — real
-// gob serialization, real Accept/Dial, the works. Only the addresses are
-// fake-ish (127.0.0.1 with OS-assigned ports); the network stack underneath
-// is genuine.
+// Replicates a command over REAL TCP sockets on localhost — real gob
+// serialization, real Accept/Dial. Only the addresses are synthetic
+// (127.0.0.1 with OS-assigned ports); the network stack underneath is genuine.
 func TestReplicationOverRealNetwork(t *testing.T) {
 	const n = 3
 	peers := make([]int, n)
@@ -19,38 +20,55 @@ func TestReplicationOverRealNetwork(t *testing.T) {
 		peers[i] = i
 	}
 
+	// One Transport shared by every node: unlike the in-memory fake, a real
+	// transport has no notion of "from" — it only dials out, so there is
+	// nothing per-node to configure.
 	addrs := map[int]string{}
-	transport := NewRPCTransport(addrs) // one Transport, shared by every node —
-	// a real transport has no notion of "from", unlike the in-memory fake,
-	// since it just dials out; there's nothing per-node to configure.
+	transport := NewRPCTransport(addrs)
 
 	rafts := make([]*raft.Raft, n)
+	dbs := make([]*storage.DB, n)
 	listeners := make([]net.Listener, n)
 	for i := 0; i < n; i++ {
+		db, err := storage.Open(t.TempDir())
+		if err != nil {
+			t.Fatalf("storage.Open for node %d: %v", i, err)
+		}
+		dbs[i] = db
+
 		r := raft.NewRaft(i, peers, transport, raft.NewMemoryPersister())
 		rafts[i] = r
+		nd := node.NewNode(r, db)
 
-		listener, err := Serve(r, "127.0.0.1:0") // :0 = let the OS pick a free port
+		listener, err := ServeNode(r, nd, "127.0.0.1:0") // :0 = OS picks a free port
 		if err != nil {
-			t.Fatalf("Serve failed for node %d: %v", i, err)
+			t.Fatalf("ServeNode for node %d: %v", i, err)
 		}
 		listeners[i] = listener
-		addrs[i] = listener.Addr().String() // visible to `transport` immediately — same map
+		addrs[i] = listener.Addr().String() // same map the transport holds
 
 		r.Start()
 	}
-	defer func() {
+	t.Cleanup(func() {
+		// Stop Raft and close listeners before releasing the storage engines,
+		// so no apply loop or in-flight RPC touches a DB that is closing. On
+		// Windows an open handle also blocks t.TempDir()'s cleanup.
 		for _, r := range rafts {
 			r.Stop()
 		}
 		for _, l := range listeners {
 			l.Close()
 		}
-	}()
+		time.Sleep(50 * time.Millisecond)
+		for _, db := range dbs {
+			db.Close()
+		}
+	})
 
 	leader := waitForLeader(t, rafts)
 
-	if _, _, isLeader := rafts[leader].Propose("hello-over-the-wire"); !isLeader {
+	cmd := node.Command{ID: 1, Op: node.OpPut, Key: []byte("k"), Value: []byte("v")}
+	if _, _, isLeader := rafts[leader].Propose(cmd); !isLeader {
 		t.Fatalf("expected %d to still be leader", leader)
 	}
 

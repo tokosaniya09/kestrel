@@ -7,15 +7,6 @@ import (
 	"path/filepath"
 )
 
-// This file is provided. It gives you two things:
-//   1. sstableIterator — a cursor that walks one SSTable's records in key order.
-//   2. Compact       — the orchestration that snapshots the SSTables, calls your
-//                      merge (merge.go), writes the result, and deletes the old files.
-//
-// It assumes your SSTable (sstable.go) still has the fields from the Phase 2
-// guide: `f *os.File` and `index []indexEntry`. If you renamed them, adjust the
-// two references below.
-
 // sstableIterator is a read cursor over one SSTable's records in ascending key
 // order. It walks the in-memory index and reads each record from disk on demand.
 type sstableIterator struct {
@@ -79,14 +70,14 @@ func (db *DB) Compact() error {
 		iters = append(iters, db.sstables[i].Iterator())
 	}
 
-	merged, err := mergeSSTables(iters) // <-- YOU implement this in merge.go
+	merged, err := mergeSSTables(iters)
 	if err != nil {
 		return err
 	}
 
-	// Write the merged records as one new SSTable. We reuse the Phase 2 writer by
-	// loading the records into a fresh memtable first. Simplification: this holds
-	// the compacted key set in memory; a production compactor streams to disk.
+	// Write the merged records as one new SSTable, reusing the memtable writer by
+	// loading them into a fresh memtable first. Simplification: this holds the
+	// compacted key set in memory; a production compactor streams to disk.
 	m := NewMemtable()
 	for _, r := range merged {
 		m.Put(r.key, r.value) // merged output contains no tombstones
@@ -120,7 +111,8 @@ func (db *DB) Compact() error {
 	// Crash window: if we die between writing the new file and removing the old
 	// ones, a restart loads BOTH. Reads stay correct (the new file has a higher
 	// generation number, so it wins), but the old files leak until something
-	// cleans them up. The manifest in a later phase closes this window properly.
+	// cleans them up. A manifest recording the live SSTable set would close this
+	// window properly — see the limitations section in README.md.
 	for _, s := range old {
 		s.Close()
 	}

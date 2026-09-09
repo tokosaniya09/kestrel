@@ -10,22 +10,8 @@ import "bytes"
 //   - tombstones dropped entirely — safe because this is a FULL compaction, so
 //     no older SSTable survives for a tombstone to shadow.
 //
-// This is the one function you implement in Phase 3a. See PHASE3.md
-// "Step 2 — the merge" for the full walkthrough.
-//
-// Algorithm (no heap needed; k is small):
-//
-//	loop:
-//	  1. Among all Valid() iterators, find the smallest current key.
-//	     If none is valid, you're done — return.
-//	  2. The newest version of that key is the FIRST iterator in slice order
-//	     (lowest index) whose current key equals the smallest. Remember its record.
-//	  3. Advance EVERY iterator whose current key equals the smallest, so each
-//	     copy of that key is consumed (each SSTable has a key at most once, so
-//	     that's one Next() per matching iterator). Check Err() after advancing.
-//	  4. If the remembered (newest) record is NOT a tombstone, append it to output.
-//
-// You'll want:  import "bytes"   (bytes.Compare for step 1, bytes.Equal for 2-3).
+// No heap is needed here: k is the number of SSTables, which stays small, so a
+// linear scan for the smallest key each round is cheaper than maintaining one.
 func mergeSSTables(iters []*sstableIterator) ([]record, error) {
 	var out []record
 

@@ -3,14 +3,11 @@ package node
 import "errors"
 
 // LinearizableGet serves a read that reflects every write which completed
-// before this call started — the guarantee plain Get deliberately does not
-// provide (see PHASE8.md).
+// before this call started — the guarantee plain Get does not provide.
 //
-// Provided: the interesting work is in raft.ReadIndex (your Phase 11 task).
-// This is just the wiring — establish the read index, then read local state.
-// Note the ORDER: ReadIndex must return successfully BEFORE we touch the DB.
-// Reading first and confirming afterward would prove nothing, since the value
-// could have been stale at the moment we read it.
+// The order matters: ReadIndex must return successfully before the DB is
+// touched. Reading first and confirming afterward would prove nothing, since
+// the value could already have been stale when it was read.
 func (n *Node) LinearizableGet(key []byte) ([]byte, bool, error) {
 	if err := n.raft.ReadIndex(); err != nil {
 		// Not the leader (or lost leadership mid-protocol) — surface it in the

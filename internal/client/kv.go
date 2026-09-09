@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"time"
+
 	"kestrel/internal/rpc"
 )
 
@@ -58,11 +59,10 @@ func (c *Client) Delete(key []byte) error {
 	return fmt.Errorf("delete failed after %d attempts", maxAttempts)
 }
 
-// Get does NOT chase the leader: any node answers a read from its own local
-// state (see PHASE8.md on why that read path is deliberately not
-// linearizable). There's no "wrong node" to be redirected away from, so
-// GetReply carries no LeaderHint — the only failure to handle is a node
-// being unreachable.
+// Get does not chase the leader: any node answers a read from its own local
+// state, so there is no "wrong node" to be redirected away from and the only
+// failure to handle is an unreachable one. The tradeoff is that the result may
+// be slightly stale — use LinearizableGet when that isn't acceptable.
 func (c *Client) Get(key []byte) ([]byte, bool, error) {
 	args := rpc.GetArgs{Key: key}
 	for attempt := 0; attempt < maxAttempts; attempt++ {

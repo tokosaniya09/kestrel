@@ -1,15 +1,11 @@
 package raft
 
-// This is your Phase 5 implementation file: the LEADER'S replication decisions.
-// All three methods run under r.mu (their callers hold the lock — see
-// broadcastAppendEntries in raft.go), so — same discipline as election.go — you
-// write pure state logic here: no goroutines, no RPCs, no releasing the lock.
+// The leader's replication decisions: what to send each follower, and when an
+// entry counts as committed. All three methods run under r.mu, held by their
+// caller (broadcastReplication in raft.go), and none of them send RPCs.
 //
-// The FOLLOWER side (appending entries, truncating conflicts, advancing its own
-// commitIndex) lives in handleAppendEntries in election.go, which you'll update
-// by hand per PHASE5.md — that's fiddly slice surgery, so the guide gives it to
-// you in full. THIS file — deciding what to send each follower, and when an
-// entry counts as committed — is the real content of Phase 5, so it's yours.
+// The follower side — appending entries, truncating conflicts, advancing its
+// own commitIndex — lives in handleAppendEntries in election.go.
 
 // buildAppendEntriesArgs constructs what to send to peer, based on how much of
 // the log peer is believed to have (r.nextIndex[peer]).

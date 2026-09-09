@@ -1,22 +1,16 @@
 package raft
 
-// This is your Phase 4 implementation file. Four methods, all running under the
-// lock (their callers acquire r.mu for you), so you write pure state-machine
-// logic — no goroutines, no locking. See PHASE4.md for the full walkthrough.
+// Leader election and the follower-side RPC handlers. Every method here runs
+// under r.mu — startElection takes the lock itself (and must release it before
+// sending RPCs); the handlers are called with it already held.
 
 // startElection runs when the election timeout fires. It turns this node into a
 // candidate for a new term and tries to win a majority of votes.
 //
-// Steps:
-//  1. Under the lock: currentTerm++, role = Candidate, votedFor = own id,
-//     resetElectionTimer(), and snapshot the new term + build a RequestVoteArgs.
-//  2. Release the lock, then gather votes:
-//        granted := 1 + r.requestVotesFromPeers(args)   // 1 = your own vote
-//  3. Re-acquire the lock. Only become leader if you're STILL a candidate in the
-//     SAME term you started (requestVotesFromPeers may have stepped you down on a
-//     higher term, or a heartbeat may have arrived) AND granted isMajority.
-//
-// See PHASE4.md "Step 1 — startElection".
+// The re-check after gathering votes is essential: the lock is released while
+// RPCs are in flight, so by the time they return this node may have been
+// stepped down by a higher term or accepted another leader's heartbeat.
+// Becoming leader without re-checking could produce two leaders in one term.
 func (r *Raft) startElection() {
 	r.mu.Lock()
 	r.currentTerm++
@@ -74,7 +68,8 @@ func (r *Raft) becomeLeader() {
 //     candidate (votedFor == -1 || votedFor == args.CandidateID). On granting,
 //     record votedFor and resetElectionTimer() (you've "heard from" the cluster).
 //
-// See PHASE4.md "Step 2", PHASE5.md "Step 4c".
+// The log-freshness check is what prevents a node whose log has fallen behind
+// from winning an election and overwriting committed history.
 func (r *Raft) handleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term)

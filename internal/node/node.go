@@ -34,17 +34,15 @@ func NewNode(r *raft.Raft, db *storage.DB) *Node {
 }
 
 // applyLoop drains committed entries from Raft and applies them to the local
-// storage engine — the actual "state machine" half of state-machine
-// replication. Provided: this is mechanical dispatch, the same category as
-// Raft's own applyLoop.
+// storage engine — the state machine half of state-machine replication.
 func (n *Node) applyLoop() {
 	for msg := range n.raft.ApplyCh() {
 		if msg.IsSnapshot {
-			// Installing a received snapshot into the local storage engine is
-			// a later phase's problem — for now, an incoming snapshot just
-			// means "trust that your log will replay correctly from here,"
-			// which is already true since storage.DB persists everything
-			// itself. Flagged as a known gap in PHASE8.md.
+			// Received snapshots are not yet installed into the storage
+			// engine. This is safe in practice only because storage.DB
+			// persists everything itself, so a node recovers by replaying its
+			// own log — but a node that genuinely needed a snapshot to catch
+			// up would not get the data. See README.md's limitations.
 			continue
 		}
 
