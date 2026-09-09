@@ -24,11 +24,20 @@ type DeleteReply struct {
 	LeaderHint int
 }
 
-// GetArgs/GetReply have no LeaderHint at all — see KVService.Get.
-type GetArgs struct{ Key []byte }
+// GetArgs carries a Linearizable flag: a plain read can be served by ANY node
+// from local state (fast, possibly stale), while a linearizable read must go
+// through the leader's ReadIndex protocol. GetReply therefore needs the same
+// Success/LeaderHint shape as Put/Delete — a linearizable read CAN be
+// redirected, unlike the plain kind.
+type GetArgs struct {
+	Key           []byte
+	Linearizable  bool
+}
 type GetReply struct {
-	Value []byte
-	Found bool
+	Value      []byte
+	Found      bool
+	Success    bool
+	LeaderHint int // valid when Success is false
 }
 
 // KVService exposes a *node.Node's Put/Get/Delete over RPC for EXTERNAL
@@ -78,18 +87,40 @@ func (s *KVService) Delete(args DeleteArgs, reply *DeleteReply) error {
 	return err
 }
 
-// Get has no leader-redirect concept at all: ANY node can answer directly
-// from its own local storage engine, exactly as node.Node.Get already allows
-// (see PHASE8.md's note on why that's not linearizable). There's nothing to
-// redirect, so there's no LeaderHint here — Put/Delete need consensus before
-// they can succeed; a plain read doesn't wait for anything.
+// Get serves either kind of read depending on args.Linearizable.
+//
+// A PLAIN read is answered by any node from local state — fast, no consensus,
+// possibly slightly stale (Phase 8's deliberate tradeoff).
+//
+// A LINEARIZABLE read goes through node.LinearizableGet, which requires this
+// node to be the leader and to prove it still is (Phase 11's ReadIndex). If
+// it isn't, that comes back as a *node.NotLeaderError and is translated into
+// the same structured redirect Put/Delete use — remember net/rpc serializes
+// errors as plain strings, so the hint must travel in the payload.
 func (s *KVService) Get(args GetArgs, reply *GetReply) error {
-	value, found, err := s.node.Get(args.Key)
+	var (
+		value []byte
+		found bool
+		err   error
+	)
+	if args.Linearizable {
+		value, found, err = s.node.LinearizableGet(args.Key)
+	} else {
+		value, found, err = s.node.Get(args.Key)
+	}
+
 	if err != nil {
+		var nle *node.NotLeaderError
+		if errors.As(err, &nle) {
+			reply.Success = false
+			reply.LeaderHint = nle.LeaderHint
+			return nil // structured, expected — not an RPC-level error
+		}
 		return err
 	}
 	reply.Value = value
 	reply.Found = found
+	reply.Success = true
 	return nil
 }
 

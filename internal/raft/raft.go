@@ -466,3 +466,91 @@ func (r *Raft) broadcastReplication() {
 		}(peer)
 	}
 }
+
+// confirmStillLeader sends a heartbeat round and reports whether a MAJORITY of
+// the cluster acknowledged this node as leader at `term`. Provided — this is
+// the same concurrent fan-out pattern as requestVotesFromPeers, and it is the
+// mechanism that turns "I believe I'm the leader" into "a majority just now
+// confirmed I'm the leader."
+//
+// Why that distinction matters: a partitioned leader does NOT know it's been
+// deposed — nothing informs it. It would keep answering reads from state
+// frozen at the moment it was cut off. Requiring a fresh majority ack rules
+// that out: any two majorities of the same cluster overlap in at least one
+// node, and a node that has moved to a higher term rejects this heartbeat
+// rather than acking it.
+//
+// It counts this node itself as one ack (a leader trivially agrees it's the
+// leader), then adds peer acks. Steps down on any higher-term reply, exactly
+// like the other fan-outs.
+func (r *Raft) confirmStillLeader(term int) bool {
+	r.mu.Lock()
+	if r.role != Leader || r.currentTerm != term {
+		r.mu.Unlock()
+		return false
+	}
+	args := AppendEntriesArgs{
+		Term:         r.currentTerm,
+		LeaderID:     r.id,
+		PrevLogIndex: r.lastLogIndex(),
+		PrevLogTerm:  r.lastLogTerm(),
+		LeaderCommit: r.commitIndex,
+	}
+	peers := r.otherPeers()
+	r.mu.Unlock()
+
+	var (
+		mu   sync.Mutex
+		acks = 1 // ourselves
+		wg   sync.WaitGroup
+	)
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer int) {
+			defer wg.Done()
+			reply, ok := r.transport.SendAppendEntries(peer, args)
+			if !ok {
+				return
+			}
+			r.mu.Lock()
+			if reply.Term > r.currentTerm {
+				r.becomeFollower(reply.Term)
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+			if reply.Success {
+				mu.Lock()
+				acks++
+				mu.Unlock()
+			}
+		}(peer)
+	}
+	wg.Wait()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Re-check: we may have been deposed while unlocked (same discipline as
+	// startElection's re-check before becomeLeader).
+	if r.role != Leader || r.currentTerm != term {
+		return false
+	}
+	return r.isMajority(acks)
+}
+
+// waitForApplied blocks until lastApplied reaches at least index, or timeout
+// elapses. Provided — a simple poll, matching the tick-based style of
+// applyLoop rather than introducing condition variables.
+func (r *Raft) waitForApplied(index int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		applied := r.lastApplied
+		r.mu.Unlock()
+		if applied >= index {
+			return true
+		}
+		time.Sleep(tickInterval)
+	}
+	return false
+}

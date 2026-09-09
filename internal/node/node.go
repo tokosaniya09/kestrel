@@ -106,3 +106,7 @@ func (e *NotLeaderError) Error() string {
 	}
 	return fmt.Sprintf("not the leader — try node %d", e.LeaderHint)
 }
+
+// raftErrNotLeader mirrors raft's not-leader sentinel so LinearizableGet can
+// distinguish "ask someone else" from a genuine failure.
+var raftErrNotLeader = raft.ErrNotLeader
